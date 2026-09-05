@@ -135,10 +135,51 @@ def run_hbot(container: str, *args: str, timeout: int = 15) -> str:
     return result.stdout
 
 
+CONFIG_NUMERIC_FIELDS = {
+    "order_amount": float, "bid_spread": float, "ask_spread": float,
+    "order_refresh_time": int,
+}
+
+
 def read_current_config(container: str) -> dict:
-    raw = run_hbot(container, "config", "--json")
-    data = json.loads(raw)
-    return data.get("strategy", {}).get("fields", {})
+    """Read the live script config straight off disk (`docker exec ... cat`)
+    instead of `hbot config --json`. The latter pays hbot CLI's own cold
+    Python-interpreter-startup cost on every single invocation (~4-5s,
+    measured, vs. ~0.2s for a plain `cat`) — since this is called on every
+    poll AND at the top of every control-panel POST (to merge a partial
+    change into the full config before writing), that made every control
+    action take 5+ seconds with no progress feedback, which is what made
+    "add pair" etc. look like a no-op (hummingbot-setup-spec.md Phase 1c).
+    This is a minimal decoder for exactly the format render_yaml() writes
+    below, not a general YAML parser — safe because this file is only ever
+    written by that function."""
+    result = subprocess.run(
+        ["docker", "exec", container, "cat", CONFIG_FILE_PATH],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return {}
+    fields: dict = {}
+    pairs: list = []
+    in_pairs = False
+    for line in result.stdout.splitlines():
+        if in_pairs and line.startswith("- "):
+            pairs.append(line[2:].strip())
+            continue
+        in_pairs = False
+        if line.strip() == "trading_pairs:":
+            in_pairs = True
+            continue
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if key == "controllers_config":
+            continue  # always [] for our script deploys
+        cast = CONFIG_NUMERIC_FIELDS.get(key)
+        fields[key] = cast(value) if cast else value
+    fields["trading_pairs"] = pairs
+    return fields
 
 
 def bot_boot_age_s(container: str) -> float:
@@ -355,6 +396,22 @@ PAGE_TEMPLATE = """<!doctype html>
 <h1>Hummingbot Paper Trading Status</h1>
 <div class="meta">Auto-refreshes every 5s. Source: <code>docker exec hummingbot hbot status/history</code>.</div>
 <div id="app">Loading&hellip;</div>
+
+<!--
+Feedback elements for control actions live outside #app on purpose: #app's
+innerHTML is fully replaced by every refresh() call (each control action
+triggers one immediately, and the 5s poll triggers one on its own), which
+was wiping out the just-set banner/error/manual-command text before it was
+ever visible — the "no-op" bug from hummingbot-setup-spec.md Phase 1c.
+Keeping them outside the regenerated block means refresh() can't touch them.
+-->
+<div id="banner" class="banner" style="display:none;"></div>
+<div id="controlError" class="error" style="display:none;"></div>
+<div id="manualCommand" style="display:none;">
+  <div class="meta">Config written. Run this in your own terminal to apply it (see hummingbot-setup-spec.md Phase 1c for why this step is manual):</div>
+  <pre id="manualCommandText"></pre>
+</div>
+
 <script>
 function esc(s) { return (s ?? "").toString().replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
@@ -409,12 +466,6 @@ async function refresh() {
 
     <section class="controls">
       <h3>Controls</h3>
-      <div id="banner" class="banner" style="display:none;"></div>
-      <div id="controlError" class="error" style="display:none;"></div>
-      <div id="manualCommand" style="display:none;">
-        <div class="meta">Config written. Run this in your own terminal to apply it (see hummingbot-setup-spec.md Phase 1c for why this step is manual):</div>
-        <pre id="manualCommandText"></pre>
-      </div>
 
       <h4>Trading Pairs</h4>
       <ul id="pairList"></ul>

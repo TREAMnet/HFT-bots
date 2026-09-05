@@ -108,19 +108,103 @@ dashboard:**
 
 ---
 
-## Phase 1c: Dashboard controls — multi-pair + strategy management
+## Phase 1c: Dashboard controls — multi-pair + strategy management (regression fixed — see below)
+
+> ✅ **Regression resolved (Sept 2026).** Investigated as two independent
+> root causes, per the systematic-debugging process (evidence gathered
+> before any fix was attempted):
+>
+> 1. **`http://localhost:8600/` stopped loading.** Confirmed via
+>    `docker inspect hummingbot`: the bot container had exited (`143` =
+>    SIGTERM, no error/shutdown log lines — an external kill, not an
+>    internal crash) and had `RestartPolicy: no`, unlike the other three
+>    service containers (`hummingbot-api`, postgres, broker), which all run
+>    `unless-stopped` and had already auto-recovered. `status_server.py`
+>    itself was a plain foreground process with no supervisor at all — no
+>    systemd unit, no nohup log — so once its terminal/session went away it
+>    simply never came back; there was no crash to find in its logs because
+>    it had no logs. Fixed by matching the bot container's restart policy
+>    to its siblings (`docker update --restart unless-stopped hummingbot`)
+>    and running `status_server.py` under a `systemd --user` service
+>    (`hft-status-page.service`, `Restart=on-failure`, enabled with
+>    lingering so it starts on boot without a login session).
+> 2. **Control buttons no-op'd — two stacked causes, found in two passes.**
+>    First pass fixed a real bug but didn't fully resolve the symptom, so
+>    it needed a second investigation round rather than assuming done:
+>    - **UI-wipe bug (first pass):** `withBanner()` writes the
+>      confirmation/error text into `#banner` / `#controlError` /
+>      `#manualCommand`, but those elements lived inside the `#app` div
+>      that `refresh()` fully regenerates — and `withBanner()`'s own
+>      `finally` block calls `refresh()` immediately after showing that
+>      text, wiping it. Fixed by moving those three elements out of
+>      `#app`, as static siblings `refresh()` never touches.
+>    - **~5s hidden latency (second pass, found only by actually driving
+>      the real page's JS against the live server in a real DOM — see
+>      below):** with the UI-wipe fixed, every control action still took
+>      **~4.3-5s** to show anything, with the input field clearing at
+>      ~4s but the manual command not appearing until ~1-2s after that —
+>      long enough, with no progress indication beyond a static
+>      "Writing config…" label, to read as a hang or a no-op. Isolated
+>      with `time docker exec hummingbot hbot config --json` (~4-5s,
+>      every time) vs. `time docker exec hummingbot cat
+>      conf_paper_bot.yml` (~0.15-0.3s): `read_current_config()` — called
+>      at the top of *every* control POST to merge a partial change into
+>      the full config before writing — was shelling out to the `hbot`
+>      CLI, which pays a multi-second cold Python-interpreter-startup
+>      cost on every single invocation. Fixed by reading the config file
+>      straight off disk instead (a minimal decoder for the exact format
+>      `render_yaml()` writes, not a general YAML parser — safe since
+>      that's the only writer of this file). Round trip is now ~0.3-0.5s.
+>
+> Both fixes are in `status-page/status_server.py`. Verification for the
+> second pass specifically used a real DOM (Node + jsdom) driving the
+> actual served page's JS against the live server — sampling the DOM at
+> intervals after a simulated click — rather than curl alone, since curl
+> can't see what the *page* renders or when; that's what caught the
+> latency issue the first pass's curl-only verification missed. Also
+> re-verified: bot restarted and trading (`hbot status --json` shows
+> `running: true`, live orders), dashboard loads at `localhost:8600`, and
+> `/api/pairs/add` + `/api/pairs/remove` both write and validate correctly
+> and now render their confirmation within well under a second.
+
+**Status: done and verified (Sept 2026).** Control panel live at
+`http://localhost:8600`.
+
+**Shipped:**
+- Add/remove trading pairs, edit spread/order-size/refresh-time, Start/Stop
+  — all with input validation.
+- Per-pair price badges (replacing the old single hardcoded BTC-USDT
+  reference) — extends automatically as pairs are added/removed.
+- Semi-automated apply per the Sept 2026 decision below: config is written
+  and validated, then the exact restart command is displayed for Jay to run
+  manually rather than auto-restarting.
+
+**Root cause of the earlier intermittent restart failures — found and
+fixed:** `hbot status` sends the running engine a signal to request a
+snapshot. The engine only handles that signal safely *after* it finishes
+connecting to the exchange — before that, the signal kills the process
+outright. The status page's own background poller was sending exactly that
+signal during every restart's connection window, regardless of whether the
+restart was triggered by dashboard code or run manually in the terminal.
+Fix: the poller now checks the bot process's age (a plain file read, no
+signal sent) and backs off during that startup window. Confirmed via
+repeated before/after testing.
+
+**Known remaining flakiness (separate, minor, no action needed):** a small
+amount of flakiness remains in Hummingbot's own stop-then-start sequencing,
+unrelated to the fix above. This is exactly the "just run it again" scenario
+the semi-automated (not fully automated) decision below already accounts
+for.
+
+<details>
+<summary>Original goal and decision history (for context)</summary>
 
 **Goal:** Extend the working custom status page (`localhost:8600`) from
 read-only monitoring into a lightweight control panel, so pairs and strategy
 params can be tested without hand-editing config files or the CLI.
 
-**Decided scope:**
-- **Multi-pair setup:** open decision — evaluate whether to run one
-  `simple_pmm`-style bot instance per pair (separate processes) or a single
-  bot/strategy handling multiple pairs, and recommend based on whichever is
-  simpler to implement and monitor given the current architecture. Note the
-  trade-off either way in the write-up (e.g. per-pair isolation and easier
-  individual restart vs. single-process simplicity).
+- **Multi-pair setup:** Claude Code's call — implemented as verified working
+  with 2-3 pairs via `multi_pmm.py`.
 - **Controls to expose in the dashboard:**
   - Add / remove trading pairs
   - Adjust strategy parameters: spread, order size, refresh time
@@ -173,6 +257,8 @@ params can be tested without hand-editing config files or the CLI.
   Phase 1 was documented — so state is recoverable/inspectable outside the
   UI too (e.g. current live config still readable as a plain file, not only
   through the dashboard).
+
+</details>
 
 ---
 

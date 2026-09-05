@@ -58,25 +58,54 @@ signal-based/discretionary strategies, which isn't Hummingbot's focus).
   active orders, fill history, and computed PnL (derived from trade
   history, since the dashboard's PnL field isn't available on this path).
 
-**Phase 1c — Dashboard controls: landed on a reduced, semi-automated version.**
-- `multi_pmm.py` (multi-pair strategy script) verified working with 2-3
-  pairs trading correctly; control endpoints (add/remove pairs, adjust
-  spread/order size/refresh time, start/stop) built with input validation,
-  all committed.
-- Full automation (dashboard writes config *and* restarts the bot itself)
-  was attempted but hit an intermittent, unresolved second bug on top of
-  one real bug that was found and fixed (a race between the status page's
-  own polling and Hummingbot's engine startup). Isolated tests gave
-  contradictory signals — classic flaky/race-condition territory, not
-  something worth open-ended debugging time on a hobby project.
-- **Decision (Sept 2026):** dropped to a reduced version — dashboard writes
-  config and validates input (the reliable, verified parts) but surfaces a
-  manual restart command instead of auto-restarting. The Task 11
-  control-panel UI is being built on top of this reduced flow, not the
-  flaky automated one. Full automation may be revisited later if the manual
-  step proves annoying — not a current priority.
-- Explicitly out of scope throughout: adjusting paper trade balances
-  (current balances are sufficient for testing).
+**Phase 1c — Dashboard controls: regression found and fixed (Sept 2026).**
+
+Two separate root causes, not one shared crash:
+1. **`http://localhost:8600/` stopped loading:** `status_server.py` was
+   running as a plain foreground process with nothing supervising it, and
+   the `hummingbot` bot container had no Docker restart policy (`no`, vs.
+   `unless-stopped` on the other three service containers). When the host
+   restarted, `hummingbot-api`/postgres/broker came back on their own but
+   the bot container and the status page did not — confirmed via
+   `docker inspect` (bot container `Exited (143)`, i.e. SIGTERM, with no
+   error/shutdown log entries — an external kill, not a crash) and the
+   status page process being entirely absent (no PID, nothing on
+   port 8600). Fixed by giving the `hummingbot` container
+   `--restart unless-stopped` (matching its siblings) and running
+   `status_server.py` as a `systemd --user` service
+   (`hft-status-page.service`, `Restart=on-failure`, lingering enabled) so
+   both now survive reboots and crashes without manual relaunching.
+2. **Control buttons no-op'd — two causes, not one.** A first fix (moving
+   the confirmation/error banner out of the `#app` div that `refresh()`
+   regenerates on every poll, which was wiping the message before it
+   rendered) was real but insufficient — Jay reported the symptom
+   persisting. Re-investigated with a real DOM (Node + jsdom driving the
+   actual served page against the live server, not just curl) and found a
+   second cause stacked on top: every control POST calls
+   `read_current_config()` first, which shelled out to `hbot config
+   --json` — costing ~4-5s per call (cold Python-interpreter startup)
+   vs. ~0.2s for a plain `docker exec ... cat` of the same file. That
+   made every action take ~5s with no progress indication beyond a
+   static label, reading as a hang. Fixed by reading the config file
+   directly instead of through the `hbot` CLI. Round trip is now
+   ~0.3-0.5s, confirmation renders promptly and stays visible.
+
+What shipped as part of the original Phase 1c build (for reference):
+- Control panel: add/remove pairs, edit spread/order-size/refresh-time,
+  Start/Stop, input-validated.
+- Per-pair price badges replacing the old hardcoded BTC-USDT reference.
+- Semi-automated apply: config written + validated, manual restart command
+  displayed rather than auto-restart.
+- Root cause of the *earlier* (separate, already-fixed) intermittent
+  restart issue: the status page's background poller was sending a signal
+  (`hbot status`) that could kill a freshly-restarting bot before it
+  finished connecting to the exchange. Fixed by checking process age
+  instead of signaling during that window.
+- Explicitly out of scope throughout: adjusting paper trade balances.
+
+**Phase 1 overall: fully verified working again** — paper trading,
+monitoring, and multi-pair controls all confirmed live after the Phase 1c
+regression fix above.
 
 **Phase 2 — Condor (AI agent layer): not started, deliberately deferred.**
 - Repo: `https://github.com/hummingbot/condor`
