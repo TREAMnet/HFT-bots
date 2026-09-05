@@ -136,7 +136,7 @@ def run_hbot(container: str, *args: str, timeout: int = 15) -> str:
 
 
 CONFIG_NUMERIC_FIELDS = {
-    "order_amount": float, "bid_spread": float, "ask_spread": float,
+    "bid_spread": float, "ask_spread": float,
     "order_refresh_time": int,
 }
 
@@ -161,14 +161,25 @@ def read_current_config(container: str) -> dict:
         return {}
     fields: dict = {}
     pairs: list = []
+    amounts: dict = {}
+    legacy_amount = None
     in_pairs = False
+    in_amounts = False
     for line in result.stdout.splitlines():
         if in_pairs and line.startswith("- "):
             pairs.append(line[2:].strip())
             continue
+        if in_amounts and line.startswith("  ") and ":" in line:
+            pair, _, amount = line.strip().partition(":")
+            amounts[pair.strip()] = float(amount.strip())
+            continue
         in_pairs = False
+        in_amounts = False
         if line.strip() == "trading_pairs:":
             in_pairs = True
+            continue
+        if line.strip() == "order_amount:":
+            in_amounts = True
             continue
         key, sep, value = line.partition(":")
         if not sep:
@@ -176,9 +187,19 @@ def read_current_config(container: str) -> dict:
         key, value = key.strip(), value.strip()
         if key == "controllers_config":
             continue  # always [] for our script deploys
+        if key == "order_amount":
+            # Pre-conversion configs wrote this as one scalar shared by every
+            # pair; tolerate it so the first poll after deploy (before this
+            # server has written a new-format file) doesn't error out.
+            try:
+                legacy_amount = float(value)
+            except ValueError:
+                pass
+            continue
         cast = CONFIG_NUMERIC_FIELDS.get(key)
         fields[key] = cast(value) if cast else value
     fields["trading_pairs"] = pairs
+    fields["order_amount"] = amounts or ({p: legacy_amount for p in pairs} if legacy_amount is not None else {})
     return fields
 
 
@@ -219,11 +240,13 @@ def validate_fields(fields: dict) -> str:
             return f"{key} must be a number"
         if not (0 < v < 0.5):
             return f"{key} must be between 0 and 0.5 (0%-50%)"
-    try:
-        if float(fields.get("order_amount", 0)) <= 0:
-            return "order_amount must be positive"
-    except (TypeError, ValueError):
-        return "order_amount must be a number"
+    amounts = fields.get("order_amount", {})
+    for pair in pairs:
+        try:
+            if float(amounts.get(pair, 0)) <= 0:
+                return f"order_amount for {pair} must be positive"
+        except (TypeError, ValueError):
+            return f"order_amount for {pair} must be a number"
     try:
         if int(fields.get("order_refresh_time", 0)) <= 0:
             return "order_refresh_time must be positive"
@@ -234,13 +257,15 @@ def validate_fields(fields: dict) -> str:
 
 def render_yaml(fields: dict) -> str:
     pairs_block = "\n".join(f"- {p}" for p in fields["trading_pairs"])
+    amount_block = "\n".join(f"  {pair}: {amount}" for pair, amount in fields["order_amount"].items())
     return (
         "script_file_name: multi_pmm.py\n"
         "controllers_config: []\n"
         f"exchange: {fields['exchange']}\n"
         "trading_pairs:\n"
         f"{pairs_block}\n"
-        f"order_amount: {fields['order_amount']}\n"
+        "order_amount:\n"
+        f"{amount_block}\n"
         f"bid_spread: {fields['bid_spread']}\n"
         f"ask_spread: {fields['ask_spread']}\n"
         f"order_refresh_time: {fields['order_refresh_time']}\n"
@@ -436,7 +461,8 @@ hummingbot-setup-spec.md Phase 1c (screen-recording follow-up) for the report.
   <h4>Parameters</h4>
   <label>Bid spread <input id="bidSpread" type="number" step="0.0001"></label>
   <label>Ask spread <input id="askSpread" type="number" step="0.0001"></label>
-  <label>Order amount <input id="orderAmount" type="number" step="0.001"></label>
+  <label>Order amount (USDT) <input id="orderAmountUsdt" type="number" step="0.01" oninput="updateAmountPreview()"></label>
+  <div id="orderAmountPreview" class="meta" style="margin: 4px 0 8px;"></div>
   <label>Refresh time (s) <input id="refreshTime" type="number" step="1"></label>
   <div><button onclick="applyParams()">Write parameters</button></div>
 
@@ -448,16 +474,33 @@ hummingbot-setup-spec.md Phase 1c (screen-recording follow-up) for the report.
 <script>
 function esc(s) { return (s ?? "").toString().replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
+// Populated at the end of every refresh() so updateAmountPreview() (fired on
+// every keystroke, not just on refresh) always has the latest known prices
+// and trading pairs without re-fetching.
+let lastState = {};
+
+// Amount column shows USDT notional (amount * that pair's current price), not
+// the raw base-asset quantity — see hummingbot-setup-spec.md's Sept 2026 UI
+// note for why base-asset amounts aren't comparable across pairs. Falls back
+// to the raw amount when a price isn't cached yet (e.g. a pair just added
+// this poll cycle).
+function fmtOrderAmount(amount, market, prices) {
+  const price = (prices || {})[market];
+  if (price == null) return `${amount} (no price yet)`;
+  return '$' + (amount * price).toFixed(2);
+}
+
 async function refresh() {
   const res = await fetch('/api/state');
   const s = await res.json();
+  lastState = s;
   const badge = s.running
     ? '<span class="badge running">RUNNING</span>'
     : '<span class="badge stopped">STOPPED</span>';
   const uptime = s.uptime_s != null ? Math.round(s.uptime_s) + 's' : '-';
 
   let ordersRows = s.active_orders.map(o =>
-    `<tr><td>${esc(o.market)}</td><td>${esc(o.side)}</td><td>${o.price}</td><td>${o.amount}</td><td>${esc(o.age)}</td></tr>`
+    `<tr><td>${esc(o.market)}</td><td>${esc(o.side)}</td><td>${o.price}</td><td>${fmtOrderAmount(o.amount, o.market, s.market_prices)}</td><td>${esc(o.age)}</td></tr>`
   ).join('') || '<tr><td colspan="5">No active orders</td></tr>';
 
   let balanceRows = Object.entries(s.balances).flatMap(([exch, assets]) =>
@@ -517,8 +560,39 @@ async function refresh() {
   };
   setIfIdle('bidSpread', cfg.bid_spread);
   setIfIdle('askSpread', cfg.ask_spread);
-  setIfIdle('orderAmount', cfg.order_amount);
   setIfIdle('refreshTime', cfg.order_refresh_time);
+
+  // order_amount is stored per-pair in base-asset units; show the USDT
+  // target implied by whichever configured pair currently has both an
+  // amount and a live price, so a user reopening the page sees a sensible
+  // starting value instead of a raw base-asset number.
+  const amounts = cfg.order_amount || {};
+  const refPair = (cfg.trading_pairs || []).find(p => amounts[p] != null && (s.market_prices || {})[p] != null);
+  const impliedUsdt = refPair ? amounts[refPair] * s.market_prices[refPair] : null;
+  setIfIdle('orderAmountUsdt', impliedUsdt != null ? impliedUsdt.toFixed(2) : '');
+  updateAmountPreview();
+}
+
+// Recomputes the per-pair base-asset breakdown shown under the "Order
+// amount (USDT)" field — called on every keystroke and after every refresh,
+// using the latest cached trading pairs/prices (lastState) rather than
+// re-fetching, since this is purely a client-side preview of the conversion
+// the server will do when the form is submitted.
+function updateAmountPreview() {
+  const previewEl = document.getElementById('orderAmountPreview');
+  const usdt = parseFloat(document.getElementById('orderAmountUsdt').value);
+  const pairs = ((lastState.config_fields || {}).trading_pairs) || [];
+  const prices = lastState.market_prices || {};
+  if (!usdt || !pairs.length) {
+    previewEl.textContent = '';
+    return;
+  }
+  const parts = pairs.map(p => {
+    const price = prices[p];
+    if (!price) return `${esc(p)}: no price yet`;
+    return `${Number((usdt / price).toPrecision(6))} ${esc(p.split('-')[0])}`;
+  });
+  previewEl.textContent = '= ' + parts.join(' · ') + ' (per pair, at current prices)';
 }
 
 async function withBanner(message, fn) {
@@ -564,7 +638,7 @@ function applyParams() {
   withBanner('Writing config…', () => postJson('/api/params', {
     bid_spread: parseFloat(document.getElementById('bidSpread').value),
     ask_spread: parseFloat(document.getElementById('askSpread').value),
-    order_amount: parseFloat(document.getElementById('orderAmount').value),
+    order_amount_usdt: parseFloat(document.getElementById('orderAmountUsdt').value),
     order_refresh_time: parseInt(document.getElementById('refreshTime').value, 10),
   }));
 }
@@ -636,16 +710,50 @@ class Handler(BaseHTTPRequestHandler):
             pairs = current_fields.get("trading_pairs", [])
             if pair in pairs:
                 return self._json_response(400, {"success": False, "error": f"{pair} is already added"})
+            amounts = dict(current_fields.get("order_amount", {}))
+            # market_prices is only ever fetched for pairs already in
+            # trading_pairs, so there's no price yet to convert a USDT target
+            # into this pair's base amount. Seed it from an existing pair's
+            # raw amount instead; the next "Order amount" submission
+            # re-converts every active pair (this one included) once its
+            # price is available (usually within one poll interval).
+            amounts[pair] = amounts.get(pairs[0], 0.01) if pairs else 0.01
             current_fields["trading_pairs"] = pairs + [pair]
+            current_fields["order_amount"] = amounts
             result = write_config(container, current_fields)
         elif self.path == "/api/pairs/remove":
             pair = payload.get("pair", "").strip().upper()
             current_fields["trading_pairs"] = [p for p in current_fields.get("trading_pairs", []) if p != pair]
+            current_fields["order_amount"] = {
+                p: a for p, a in current_fields.get("order_amount", {}).items() if p != pair
+            }
             result = write_config(container, current_fields)
         elif self.path == "/api/params":
-            for key in ("bid_spread", "ask_spread", "order_amount", "order_refresh_time"):
+            for key in ("bid_spread", "ask_spread", "order_refresh_time"):
                 if key in payload:
                     current_fields[key] = payload[key]
+            if "order_amount_usdt" in payload:
+                with state_lock:
+                    prices = dict(state["market_prices"])
+                pairs = current_fields.get("trading_pairs", [])
+                # Reject non-numeric/non-positive prices too, not just a missing
+                # key — a stale or failed per-pair lookup from hummingbot-api
+                # can hand back 0/null for a pair instead of omitting it, which
+                # would otherwise divide-by-zero or TypeError below.
+                missing = [p for p in pairs if not isinstance(prices.get(p), (int, float)) or prices[p] <= 0]
+                if missing:
+                    return self._json_response(400, {
+                        "success": False,
+                        "error": f"no price data yet for: {', '.join(missing)} — try again shortly",
+                        "manual_command": "",
+                    })
+                try:
+                    usdt_amount = float(payload["order_amount_usdt"])
+                except (TypeError, ValueError):
+                    return self._json_response(400, {
+                        "success": False, "error": "order_amount_usdt must be a number", "manual_command": "",
+                    })
+                current_fields["order_amount"] = {p: round(usdt_amount / prices[p], 8) for p in pairs}
             result = write_config(container, current_fields)
         elif self.path == "/api/bot/stop":
             r = subprocess.run(["docker", "exec", container, "hbot", "stop"],

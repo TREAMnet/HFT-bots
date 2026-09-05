@@ -4,7 +4,7 @@ import re
 from decimal import Decimal
 from typing import Dict, List
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
@@ -20,7 +20,7 @@ class MultiPMMConfig(StrategyV2ConfigBase):
     controllers_config: List[str] = []
     exchange: str = Field("binance_paper_trade")
     trading_pairs: List[str] = Field(default_factory=lambda: ["BTC-USDT"])
-    order_amount: Decimal = Field(Decimal("0.01"))
+    order_amount: Dict[str, Decimal] = Field(default_factory=lambda: {"BTC-USDT": Decimal("0.01")})
     bid_spread: Decimal = Field(Decimal("0.001"))
     ask_spread: Decimal = Field(Decimal("0.001"))
     order_refresh_time: int = Field(15)
@@ -47,10 +47,18 @@ class MultiPMMConfig(StrategyV2ConfigBase):
 
     @field_validator("order_amount")
     @classmethod
-    def _validate_amount(cls, v: Decimal) -> Decimal:
-        if v <= 0:
-            raise ValueError("order_amount must be positive")
+    def _validate_amount(cls, v: Dict[str, Decimal]) -> Dict[str, Decimal]:
+        for pair, amount in v.items():
+            if amount <= 0:
+                raise ValueError(f"order_amount for {pair!r} must be positive")
         return v
+
+    @model_validator(mode="after")
+    def _validate_amount_covers_pairs(self) -> "MultiPMMConfig":
+        missing = [p for p in self.trading_pairs if p not in self.order_amount]
+        if missing:
+            raise ValueError(f"order_amount is missing an entry for: {', '.join(missing)}")
+        return self
 
     @field_validator("order_refresh_time")
     @classmethod
@@ -96,10 +104,11 @@ class MultiPMM(StrategyV2Base):
             ref_price = self.connectors[self.config.exchange].get_price_by_type(trading_pair, self.price_source)
             buy_price = ref_price * Decimal(1 - self.config.bid_spread)
             sell_price = ref_price * Decimal(1 + self.config.ask_spread)
+            amount = Decimal(self.config.order_amount[trading_pair])
             orders.append(OrderCandidate(trading_pair=trading_pair, is_maker=True, order_type=OrderType.LIMIT,
-                                          order_side=TradeType.BUY, amount=Decimal(self.config.order_amount), price=buy_price))
+                                          order_side=TradeType.BUY, amount=amount, price=buy_price))
             orders.append(OrderCandidate(trading_pair=trading_pair, is_maker=True, order_type=OrderType.LIMIT,
-                                          order_side=TradeType.SELL, amount=Decimal(self.config.order_amount), price=sell_price))
+                                          order_side=TradeType.SELL, amount=amount, price=sell_price))
         return orders
 
     def adjust_proposal_to_budget(self, proposal: List[OrderCandidate]) -> List[OrderCandidate]:

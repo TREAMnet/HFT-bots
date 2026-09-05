@@ -198,27 +198,31 @@ params can be tested without hand-editing config files or the CLI.
 > price visual on the dashboard, and it should disappear/appear as pairs are
 > removed/added.
 
-> ⚠ **UI note (added Sept 2026): amounts should display in USDT, not base
-> asset.** Currently the active orders list, bid/ask order rows, and the
-> "Order amount" control field all show quantities in the pair's base asset
-> (e.g. BTC for BTC-USDT) — this is confirmed by Jay's observation and makes
-> cross-pair comparison meaningless once multiple pairs are active (0.01 BTC
-> vs. 0.1 ETH aren't comparable at a glance; $50 USDT is). Change all three
-> to show/accept USDT amounts instead.
+> ✅ **UI note (added Sept 2026, resolved Sept 2026): amounts now display in
+> USDT, not base asset.** The active orders list and the "Order amount"
+> control field previously showed quantities in the pair's base asset (e.g.
+> BTC for BTC-USDT), which made cross-pair comparison meaningless once
+> multiple pairs were active (0.01 BTC vs. 0.1 ETH aren't comparable at a
+> glance; $50 USDT is). Confirmed by Jay's observation.
 >
-> **Implementation note:** this is not just a label swap. Hummingbot's PMM
-> `order_amount` parameter is normally denominated in the **base asset**
-> (BTC, ETH, etc.), not the quote currency. Converting to/from USDT requires
-> the current market price at the time of display or input:
-> - **Display (active orders, order rows):** convert base-asset amount →
->   USDT using the live price already being fetched for the price badges.
-> - **Input (Order amount field):** convert the USDT value the user types
->   back into the base-asset amount before writing it into the strategy
->   config — Hummingbot itself still needs the base-asset number under the
->   hood, since that's what `order_amount` expects.
-> - Be explicit in the UI about which pair's price a given order-amount
->   input is being converted at, if the same "Order amount" field applies
->   across multiple pairs with different prices.
+> This wasn't just a label swap — `multi_pmm.py`'s `order_amount` field
+> changed from one shared `Decimal` (applied identically in base-asset units
+> to every pair) to a `Dict[str, Decimal]` keyed by trading pair, so each
+> pair can actually carry its own base-asset amount:
+> - **Active Orders table:** Amount column now shows `amount × that pair's
+>   live price` (the same price feeding the price badges), formatted as USDT.
+> - **Order amount control:** renamed "Order amount (USDT)"; the user types a
+>   USDT target, and the dashboard converts it to a base-asset amount per
+>   active pair (using each pair's live price) before writing
+>   `conf_paper_bot.yml` — Hummingbot's `order_amount` still needs base-asset
+>   numbers under the hood. A live preview under the field shows the
+>   resulting per-pair base-asset quantities as the user types, so it's clear
+>   the same $ value produces different BTC/ETH/SOL/DOGE quantities.
+> - Adding a new pair before ever resubmitting an amount seeds its
+>   base-asset amount from an existing pair's raw number (no price history
+>   exists yet for a pair that was just added) — a reasonable placeholder
+>   until the next "Order amount" submission re-converts every active pair
+>   at its actual price.
 - **Apply behavior: semi-automated (decided Sept 2026, see note below).**
   Dashboard writes the updated config and validates input as originally
   planned, but does **not** attempt to restart the bot process itself.
