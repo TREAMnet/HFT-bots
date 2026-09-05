@@ -110,16 +110,6 @@ dashboard:**
 
 ## Phase 1c: Dashboard controls — multi-pair + strategy management
 
-**Status (Sept 2026): partially built, blocked.** Multi-pair script
-(`multi_pmm.py`) works and is verified. Config read/write + control
-endpoints are written but restart-on-apply is unreliable — root-caused one
-real bug (a signal race between `status-page`'s poller and the engine's
-own startup sequence, now fixed) but a second, unconfirmed cause is still
-failing intermittent restarts. Control panel UI intentionally not built on
-top of this yet. Full writeup and options in the plan doc
-(`docs/superpowers/plans/2026-09-05-hummingbot-setup.md`, Task 10 known
-issue).
-
 **Goal:** Extend the working custom status page (`localhost:8600`) from
 read-only monitoring into a lightweight control panel, so pairs and strategy
 params can be tested without hand-editing config files or the CLI.
@@ -137,9 +127,35 @@ params can be tested without hand-editing config files or the CLI.
   - Start / stop the bot(s)
   - (Explicitly out of scope for now: adjusting paper trade balances —
     current paper balances are sufficient for testing.)
-- **Apply behavior: fully automated.** Changes made in the dashboard should
-  write the updated config and restart the affected bot process(es)
-  automatically — no manual CLI restart step required.
+
+> ⚠ **UI note:** the status page currently shows a BTC-USD price reference
+> visual. Once multi-pair is live, this needs to extend to **every active
+> pair**, not stay hardcoded to BTC-USD — each added pair should get its own
+> price visual on the dashboard, and it should disappear/appear as pairs are
+> removed/added.
+- **Apply behavior: semi-automated (decided Sept 2026, see note below).**
+  Dashboard writes the updated config and validates input as originally
+  planned, but does **not** attempt to restart the bot process itself.
+  Instead it surfaces the exact manual restart command for Jay to run.
+
+> ⚠ **Decision note (Sept 2026):** Full automation was attempted (Task 9)
+> and got most of the way there — `multi_pmm.py` (multi-pair script),
+> control endpoints, and input validation all work and are committed. One
+> real bug was found and fixed along the way (the status page's own
+> background poller was sending a signal that could kill a freshly-restarted
+> bot mid-startup — a race between the polling code and Hummingbot's engine
+> startup). But even after that fix, the automatic "write config → restart →
+> verify" flow still failed intermittently, with a second cause that stayed
+> unresolved despite isolated single-variable testing — each test pointed at
+> a different, sometimes contradictory culprit (classic flaky/race-condition
+> signature). Switching the container to idle-host mode was tried and made
+> things worse, not better. Rather than keep guessing or ship a control-panel
+> UI on top of an unreliable restart mechanism, the decision was made to drop
+> to this reduced, semi-automated version: config writing and validation
+> (the verified, reliable parts) stay; automatic restart is replaced with a
+> displayed manual command. Revisit full automation later only if this
+> reduced version proves genuinely annoying to live with — not a current
+> priority.
 
 **Implementation notes / things to watch:**
 - Since this now *writes* config and restarts processes (not just reads

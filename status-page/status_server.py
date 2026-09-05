@@ -14,6 +14,15 @@ container from Phase 1 step 1/2 (`docker exec hummingbot hbot ...`) — the
 same one already proven to trade correctly in Phase 1 step 2. No log
 scraping, no dependency on hummingbot-api's MQTT/controller pipeline.
 
+Phase 1c adds a control panel: add/remove trading pairs, edit strategy
+params, start/stop the bot. Applying a pair/param change writes and
+validates the config file but does NOT restart the bot automatically —
+it shows the exact command to run instead. Automatic restart was tried
+and dropped after proving intermittently unreliable (a real signal race
+between this page's own poller and the engine's startup sequence, fixed;
+plus a second, unconfirmed cause that wasn't) — see
+hummingbot-setup-spec.md Phase 1c for the full writeup.
+
 Usage: python3 status_server.py [--container hummingbot] [--port 8600]
 No third-party dependencies — stdlib only.
 """
@@ -40,11 +49,20 @@ state_lock = threading.Lock()
 # `hbot status` sends SIGUSR1 to ask the engine for a fresh snapshot — but the
 # engine only installs a SIGUSR1 handler once it finishes connecting to the
 # exchange (hummingbot/cli/engine.py `_serve()`); before that, SIGUSR1's
-# default disposition kills the process outright. This lock keeps the
-# background poller's `hbot status` calls from ever overlapping a restart's
-# vulnerable boot window — held by apply_config() for the full
-# restart-then-start sequence, checked non-blockingly by poll_loop().
-restart_lock = threading.Lock()
+# default disposition kills the process outright.
+#
+# An in-process lock around this page's OWN `hbot start` calls was tried
+# first and wasn't enough: the whole point of the semi-automated design
+# (hummingbot-setup-spec.md Phase 1c) is that the USER runs the restart
+# command in their own terminal while this page is open — proven by
+# direct A/B test to reliably fail while the poller is running and
+# reliably succeed the instant it's stopped. A lock this process controls
+# can't protect a command run outside this process. Instead, BOOT_GRACE_S
+# below makes the poller check the bot's process age (a plain file read of
+# meta.json — no signal involved) before every `hbot status` call, and
+# skip it entirely while the bot is still inside its connection window,
+# regardless of who started it.
+BOOT_GRACE_S = 12.0
 state = {
     "fetched_at": None,
     "running": False,
@@ -56,8 +74,7 @@ state = {
     "active_orders": [],
     "history_text": "",
     "fetch_error": None,
-    "market_price": None,
-    "market_pair": None,
+    "market_prices": {},
     "config_fields": {},
 }
 
@@ -78,11 +95,13 @@ def parse_env_file(path: str) -> dict:
     return values
 
 
-def fetch_market_price(api_url: str, user: str, password: str, connector: str, pair: str, timeout: int = 8):
-    """Public market price via hummingbot-api — independent of any bot's own state."""
-    if not user or not password:
-        return None
-    body = json.dumps({"connector_name": connector, "trading_pairs": [pair]}).encode()
+def fetch_market_prices(api_url: str, user: str, password: str, connector: str, pairs: list, timeout: int = 8) -> dict:
+    """Public market prices via hummingbot-api — independent of any bot's own
+    state. One request for every pair currently configured, so the price
+    list on the page tracks whatever pairs are actually active."""
+    if not user or not password or not pairs:
+        return {}
+    body = json.dumps({"connector_name": connector, "trading_pairs": pairs}).encode()
     req = urllib.request.Request(
         f"{api_url}/market-data/prices", data=body, method="POST",
         headers={
@@ -93,9 +112,9 @@ def fetch_market_price(api_url: str, user: str, password: str, connector: str, p
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-            return data.get("prices", {}).get(pair)
+            return data.get("prices", {})
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        return None
+        return {}
 
 
 def read_secret_file(path: str) -> str:
@@ -120,6 +139,24 @@ def read_current_config(container: str) -> dict:
     raw = run_hbot(container, "config", "--json")
     data = json.loads(raw)
     return data.get("strategy", {}).get("fields", {})
+
+
+def bot_boot_age_s(container: str) -> float:
+    """Seconds since the engine process (any bot, started by us or manually
+    in the user's own terminal) began booting — a plain `cat` of meta.json,
+    never a signal. Returns +inf if unreadable/unparseable (nothing running,
+    or genuinely old enough that timing doesn't matter)."""
+    result = subprocess.run(
+        ["docker", "exec", container, "cat", "/home/hummingbot/data/bot/meta.json"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return float("inf")
+    try:
+        started_at = json.loads(result.stdout)["started_at"]
+        return time.time() - float(started_at)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return float("inf")
 
 
 def validate_fields(fields: dict) -> str:
@@ -170,50 +207,32 @@ def render_yaml(fields: dict) -> str:
     )
 
 
-def apply_config(container: str, fields: dict, config_password: str) -> dict:
-    """Write the FULL merged config (fields must already contain every
-    MultiPMMConfig field, not a partial patch), restart the container for a
-    clean process state, then start the strategy. Returns
-    {"success": bool, "error": str}.
+MANUAL_RESTART_COMMAND = 'hbot stop; HBOT_PASSWORD=$(cat ~/.hbot_keystore_password) hbot start conf_paper_bot.yml'
 
-    `hbot create --values-stdin` looked like the natural fit, but it
-    refuses to overwrite an existing config name (one-shot, not an
-    upsert) — and `hbot start --replace` against the same still-running
-    interactive container was unreliable (reset to the welcome screen
-    instead of loading the new strategy). Writing the YAML directly and
-    restarting the container is what actually works — see the setup plan.
+
+def write_config(container: str, fields: dict) -> dict:
+    """Validate and write the FULL merged config (fields must already contain
+    every MultiPMMConfig field, not a partial patch) to disk. Does NOT
+    restart or start the bot — see hummingbot-setup-spec.md Phase 1c: full
+    automation (write + restart + verify) was attempted and found
+    intermittently unreliable (a confirmed signal race between this page's
+    own poller and the engine's startup sequence, fixed, plus a second,
+    unconfirmed cause that wasn't). The decision was to keep the reliable
+    part (validated config writing) and drop automatic restart in favor of
+    a displayed manual command. Returns
+    {"success": bool, "error": str, "manual_command": str}.
     """
     error = validate_fields(fields)
     if error:
-        return {"success": False, "error": error}
+        return {"success": False, "error": error, "manual_command": ""}
 
     write = subprocess.run(
         ["docker", "exec", "-i", container, "sh", "-c", f"cat > {CONFIG_FILE_PATH}"],
         input=render_yaml(fields), capture_output=True, text=True, timeout=15,
     )
     if write.returncode != 0:
-        return {"success": False, "error": write.stderr.strip() or "failed to write config"}
-
-    # Hold restart_lock for the whole restart+start sequence so the background
-    # poller (poll_loop) can't send a `hbot status` SIGUSR1 into the engine's
-    # vulnerable pre-handler boot window and kill it (see the restart_lock
-    # comment above — this was the actual root cause of every "flaky restart"
-    # symptom seen while building this feature, not a timing issue). `hbot
-    # start`'s own exit code is already the correct readiness signal: it
-    # internally waits for the engine's initial status.json write (a plain
-    # file read, not a signal) before returning, so no extra polling here.
-    with restart_lock:
-        restart = subprocess.run(["docker", "restart", container], capture_output=True, text=True, timeout=30)
-        if restart.returncode != 0:
-            return {"success": False, "error": restart.stderr.strip() or "failed to restart container"}
-
-        start = subprocess.run(
-            ["docker", "exec", "-e", f"HBOT_PASSWORD={config_password}", container, "hbot", "start", "conf_paper_bot.yml"],
-            capture_output=True, text=True, timeout=30,
-        )
-    if start.returncode != 0:
-        return {"success": False, "error": start.stdout.strip() or start.stderr.strip()}
-    return {"success": True, "error": ""}
+        return {"success": False, "error": write.stderr.strip() or "failed to write config", "manual_command": ""}
+    return {"success": True, "error": "", "manual_command": MANUAL_RESTART_COMMAND}
 
 
 def parse_active_orders(format_status: str):
@@ -239,36 +258,36 @@ def parse_active_orders(format_status: str):
     return orders
 
 
-def poll_loop(container: str, interval: float, api_url: str, api_env: str, price_connector: str, price_pair: str):
+def poll_loop(container: str, interval: float, api_url: str, api_env: str, price_connector: str, default_pair: str):
     while True:
-        # `hbot status` sends the engine a signal that's fatal during its boot
-        # window (see the restart_lock comment near its definition) — never
-        # run it while apply_config() is mid-restart. Skip this cycle
-        # entirely rather than partially update state with a mix of fresh
-        # and stale fields.
-        if not restart_lock.acquire(blocking=False):
-            time.sleep(interval)
-            continue
-        try:
-            snapshot = _poll_once(container, api_url, api_env, price_connector, price_pair)
-        finally:
-            restart_lock.release()
-
+        snapshot = _poll_once(container, api_url, api_env, price_connector, default_pair)
         with state_lock:
             state.update(snapshot)
-
         time.sleep(interval)
 
 
-def _poll_once(container: str, api_url: str, api_env: str, price_connector: str, price_pair: str) -> dict:
+def _poll_once(container: str, api_url: str, api_env: str, price_connector: str, default_pair: str) -> dict:
     snapshot = {
         "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "running": False, "strategy": None, "uptime_s": None,
         "error_count": 0, "errors": [], "balances": {},
         "active_orders": [], "history_text": "", "fetch_error": None,
-        "market_price": None, "market_pair": price_pair,
+        "market_prices": {},
         "config_fields": {},
     }
+
+    # Never send `hbot status`'s SIGUSR1 while the engine is still inside its
+    # exchange-connection window (see BOOT_GRACE_S above) — that includes a
+    # restart the user just ran manually in their own terminal, which this
+    # process has no other way to know about.
+    if bot_boot_age_s(container) < BOOT_GRACE_S:
+        snapshot["fetch_error"] = "bot is starting up — status check paused briefly to avoid interrupting it"
+        try:
+            snapshot["config_fields"] = read_current_config(container)
+        except Exception:
+            pass
+        return snapshot
+
     try:
         status_raw = run_hbot(container, "status", "--json")
         status = json.loads(status_raw)
@@ -294,9 +313,10 @@ def _poll_once(container: str, api_url: str, api_env: str, price_connector: str,
         snapshot["history_text"] = ""
         snapshot["fetch_error"] = (snapshot["fetch_error"] or "") + f" | history: {exc}"
 
+    pairs = snapshot["config_fields"].get("trading_pairs") or [default_pair]
     env = parse_env_file(api_env)
-    snapshot["market_price"] = fetch_market_price(
-        api_url, env.get("USERNAME"), env.get("PASSWORD"), price_connector, price_pair
+    snapshot["market_prices"] = fetch_market_prices(
+        api_url, env.get("USERNAME"), env.get("PASSWORD"), price_connector, pairs
     )
     return snapshot
 
@@ -309,16 +329,26 @@ PAGE_TEMPLATE = """<!doctype html>
 <style>
   body { font-family: -apple-system, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 24px; }
   h1 { font-size: 1.3rem; margin-bottom: 4px; }
+  h4 { margin: 16px 0 6px; font-size: 0.95rem; color: #ccc; }
   .meta { color: #888; font-size: 0.85rem; margin-bottom: 20px; }
   .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 0.8rem; font-weight: 600; }
   .badge.running { background: #1f7a3f; color: #fff; }
   .badge.stopped { background: #7a1f1f; color: #fff; }
+  .price-badge { display: inline-block; padding: 2px 10px; margin: 2px 4px 2px 0; border-radius: 10px; font-size: 0.8rem; background: #1a1d24; border: 1px solid #2a2d34; }
   section { margin-bottom: 28px; }
   table { border-collapse: collapse; width: 100%; max-width: 640px; }
   th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #2a2d34; font-size: 0.9rem; }
   th { color: #999; font-weight: 500; }
   pre { background: #1a1d24; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; }
   .error { color: #ff6b6b; }
+  .banner { background: #2a2410; border: 1px solid #6b5a1a; color: #e8d27a; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; }
+  ul#pairList { list-style: none; padding: 0; margin: 0 0 8px; }
+  ul#pairList li { padding: 4px 0; }
+  ul#pairList button, .controls button { margin-left: 8px; cursor: pointer; }
+  .controls input[type=text], .controls input[type=number] { width: 110px; background: #1a1d24; border: 1px solid #2a2d34; color: #e6e6e6; padding: 4px 6px; border-radius: 4px; }
+  .controls label { display: inline-block; margin: 4px 14px 4px 0; }
+  .controls button { background: #2a2d34; border: 1px solid #3a3d44; color: #e6e6e6; padding: 5px 12px; border-radius: 4px; }
+  .controls button:hover { background: #33363d; }
 </style>
 </head>
 <body>
@@ -348,17 +378,20 @@ async function refresh() {
   let errorsHtml = s.errors.length
     ? `<pre class="error">${s.errors.map(esc).join('\\n')}</pre>` : '<div>None</div>';
 
-  const marketPrice = s.market_price != null
-    ? `${esc(s.market_pair)}: <b>${s.market_price}</b>`
-    : `${esc(s.market_pair)}: <span class="error">unavailable</span>`;
+  // One badge per currently-active pair — appears/disappears as pairs are
+  // added/removed, rather than a single hardcoded pair.
+  const priceEntries = Object.entries(s.market_prices || {});
+  const priceBadges = priceEntries.length
+    ? priceEntries.map(([pair, price]) => `<span class="price-badge">${esc(pair)}: <b>${price}</b></span>`).join('')
+    : '<span class="meta">No price data</span>';
 
   document.getElementById('app').innerHTML = `
-    <div>${badge} &nbsp; strategy: <b>${esc(s.strategy || '-')}</b> &nbsp; uptime: ${uptime} &nbsp; errors (10m): ${s.error_count} &nbsp; market ${marketPrice}</div>
+    <div>${badge} &nbsp; strategy: <b>${esc(s.strategy || '-')}</b> &nbsp; uptime: ${uptime} &nbsp; errors (10m): ${s.error_count}</div>
     <div class="meta">Last fetched: ${esc(s.fetched_at)}${s.fetch_error ? ' — <span class="error">' + esc(s.fetch_error) + '</span>' : ''}</div>
 
     <section>
       <h3>Active Orders</h3>
-      <div class="meta">Reference market price — ${marketPrice}</div>
+      <div style="margin-bottom:8px">${priceBadges}</div>
       <table><thead><tr><th>Market</th><th>Side</th><th>Price</th><th>Amount</th><th>Age</th></tr></thead>
       <tbody>${ordersRows}</tbody></table>
     </section>
@@ -374,12 +407,108 @@ async function refresh() {
       <pre>${esc(s.history_text) || 'No trades found.'}</pre>
     </section>
 
+    <section class="controls">
+      <h3>Controls</h3>
+      <div id="banner" class="banner" style="display:none;"></div>
+      <div id="controlError" class="error" style="display:none;"></div>
+      <div id="manualCommand" style="display:none;">
+        <div class="meta">Config written. Run this in your own terminal to apply it (see hummingbot-setup-spec.md Phase 1c for why this step is manual):</div>
+        <pre id="manualCommandText"></pre>
+      </div>
+
+      <h4>Trading Pairs</h4>
+      <ul id="pairList"></ul>
+      <input id="newPair" type="text" placeholder="e.g. SOL-USDT">
+      <button onclick="addPair()">Add pair</button>
+
+      <h4>Parameters</h4>
+      <label>Bid spread <input id="bidSpread" type="number" step="0.0001"></label>
+      <label>Ask spread <input id="askSpread" type="number" step="0.0001"></label>
+      <label>Order amount <input id="orderAmount" type="number" step="0.001"></label>
+      <label>Refresh time (s) <input id="refreshTime" type="number" step="1"></label>
+      <div><button onclick="applyParams()">Write parameters</button></div>
+
+      <h4>Bot</h4>
+      <button onclick="botAction('start')">Start</button>
+      <button onclick="botAction('stop')">Stop</button>
+    </section>
+
     <section>
       <h3>Recent Errors</h3>
       ${errorsHtml}
     </section>
   `;
+
+  // Populate the pair list and param fields from live config — skip an
+  // input the user currently has focused so a 5s auto-refresh doesn't
+  // stomp on text they're mid-typing.
+  const cfg = s.config_fields || {};
+  document.getElementById('pairList').innerHTML = (cfg.trading_pairs || [])
+    .map(p => `<li>${esc(p)} <button onclick="removePair('${esc(p)}')">remove</button></li>`).join('')
+    || '<li class="meta">No pairs configured</li>';
+
+  const setIfIdle = (id, value) => {
+    const el = document.getElementById(id);
+    if (document.activeElement !== el) el.value = value ?? '';
+  };
+  setIfIdle('bidSpread', cfg.bid_spread);
+  setIfIdle('askSpread', cfg.ask_spread);
+  setIfIdle('orderAmount', cfg.order_amount);
+  setIfIdle('refreshTime', cfg.order_refresh_time);
 }
+
+async function withBanner(message, fn) {
+  const banner = document.getElementById('banner');
+  const errEl = document.getElementById('controlError');
+  const cmdEl = document.getElementById('manualCommand');
+  banner.textContent = message;
+  banner.style.display = 'block';
+  errEl.style.display = 'none';
+  cmdEl.style.display = 'none';
+  try {
+    const result = await fn();
+    if (!result.success) {
+      errEl.textContent = result.error || 'Unknown error';
+      errEl.style.display = 'block';
+    } else if (result.manual_command) {
+      document.getElementById('manualCommandText').textContent = result.manual_command;
+      cmdEl.style.display = 'block';
+    }
+  } finally {
+    banner.style.display = 'none';
+    refresh();
+  }
+}
+
+async function postJson(path, body) {
+  const res = await fetch(path, { method: 'POST', body: JSON.stringify(body) });
+  return res.json();
+}
+
+function addPair() {
+  const input = document.getElementById('newPair');
+  const pair = input.value.trim().toUpperCase();
+  if (!pair) return;
+  withBanner('Writing config…', () => postJson('/api/pairs/add', { pair })).then(() => input.value = '');
+}
+
+function removePair(pair) {
+  withBanner('Writing config…', () => postJson('/api/pairs/remove', { pair }));
+}
+
+function applyParams() {
+  withBanner('Writing config…', () => postJson('/api/params', {
+    bid_spread: parseFloat(document.getElementById('bidSpread').value),
+    ask_spread: parseFloat(document.getElementById('askSpread').value),
+    order_amount: parseFloat(document.getElementById('orderAmount').value),
+    order_refresh_time: parseInt(document.getElementById('refreshTime').value, 10),
+  }));
+}
+
+function botAction(action) {
+  withBanner(action === 'start' ? 'Starting…' : 'Stopping…', () => postJson(`/api/bot/${action}`, {}));
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -444,22 +573,32 @@ class Handler(BaseHTTPRequestHandler):
             if pair in pairs:
                 return self._json_response(400, {"success": False, "error": f"{pair} is already added"})
             current_fields["trading_pairs"] = pairs + [pair]
-            result = apply_config(container, current_fields, config_password)
+            result = write_config(container, current_fields)
         elif self.path == "/api/pairs/remove":
             pair = payload.get("pair", "").strip().upper()
             current_fields["trading_pairs"] = [p for p in current_fields.get("trading_pairs", []) if p != pair]
-            result = apply_config(container, current_fields, config_password)
+            result = write_config(container, current_fields)
         elif self.path == "/api/params":
             for key in ("bid_spread", "ask_spread", "order_amount", "order_refresh_time"):
                 if key in payload:
                     current_fields[key] = payload[key]
-            result = apply_config(container, current_fields, config_password)
+            result = write_config(container, current_fields)
         elif self.path == "/api/bot/stop":
             r = subprocess.run(["docker", "exec", container, "hbot", "stop"],
                                 capture_output=True, text=True, timeout=15)
             result = {"success": r.returncode == 0, "error": "" if r.returncode == 0 else r.stdout.strip()}
         elif self.path == "/api/bot/start":
-            result = apply_config(container, current_fields, config_password)
+            # Not a config-writing action, so it's fine to launch directly —
+            # only the write+auto-restart combo was dropped (see
+            # write_config's docstring). No lock needed here: the poller's
+            # own BOOT_GRACE_S check (bot_boot_age_s) already keeps it from
+            # sending `hbot status`'s signal into this call's boot window,
+            # the same as it would for a manual restart.
+            r = subprocess.run(
+                ["docker", "exec", "-e", f"HBOT_PASSWORD={config_password}", container, "hbot", "start", "conf_paper_bot.yml"],
+                capture_output=True, text=True, timeout=30,
+            )
+            result = {"success": r.returncode == 0, "error": "" if r.returncode == 0 else (r.stdout.strip() or r.stderr.strip())}
         else:
             return self._json_response(404, {"success": False, "error": "not found"})
 

@@ -960,210 +960,104 @@ git commit -m "feat: add config read/write + POST control endpoints to status-pa
 
 ---
 
-**KNOWN ISSUE — restart-after-apply is unreliable, root cause partially confirmed, not fully fixed.**
+**RESOLVED (mostly) — decision: semi-automated apply, not full automation.**
 
-Extensive debugging (well past the point where the systematic-debugging
-process says to stop guessing and report back) turned up a real, confirmed
-mechanism, and a real, confirmed fix for *one* cause of it — but restarts
-are still failing intermittently even with that fix applied, and a second
-contributing cause was never pinned down. Documenting fully here rather
-than continuing to iterate blindly.
+Jay's call (`hummingbot-setup-spec.md` Phase 1c decision note, Sept 2026):
+drop automatic restart entirely. Config writing + validation (the reliable
+part) stays; the control panel shows the exact manual restart command
+instead of running it. This sidesteps the reliability question rather
+than fully resolving it — reasonable, since the debugging below never
+reached 100% certainty.
 
-**Confirmed mechanism #1 (fixed):** `hbot status` sends the engine process
-`SIGUSR1` to request a fresh snapshot (`hummingbot/cli/commands/status.py`).
-The engine only installs a handler for that signal once it finishes
-connecting to the exchange, inside `_serve()`
-(`hummingbot/cli/engine.py`) — before that, SIGUSR1's default disposition
-**kills the process**. `status-page`'s own background poller calls `hbot
-status --json` every 5s; if that lands during a freshly-(re)started bot's
-few-second connection window, it kills the bot it's trying to monitor.
-This fully explained the very first round of "flaky restart" symptoms —
-confirmed by watching the bot boot cleanly and stay up indefinitely with
-`status-page` not running at all, then reliably die within seconds of the
-poller running again. **Fix applied:** `restart_lock` in
-`status_server.py` — held by `apply_config()` for the write-config +
-`docker restart` + `hbot start` sequence, checked non-blockingly by
-`poll_loop()`, which skips its cycle entirely rather than risk the signal.
+**Mechanism #1 (confirmed root cause, fixed properly):** `hbot status`
+sends the engine process `SIGUSR1` to request a fresh snapshot
+(`hummingbot/cli/commands/status.py`). The engine only installs a handler
+for that signal once it finishes connecting to the exchange, inside
+`_serve()` (`hummingbot/cli/engine.py`) — before that, SIGUSR1's default
+disposition **kills the process**. `status-page`'s own background poller
+calls `hbot status --json` every 5s.
 
-**Unconfirmed cause #2 (not fixed):** even with `restart_lock` in place,
-a `pairs/remove` call through the actual control endpoint still failed —
-the container's `~/hummingbot/logs/logs_conf_paper_bot.log` (the
-structured log `hbot start`'s own error path reads from) never gained a
-single new line across several failed attempts, meaning the child process
-was dying before even reaching Hummingbot's own logging setup — while
-fully manual, isolated tests (no status-page process running at all,
-several seconds' wait) succeeded reliably. This means something *other*
-than `status-page`'s poller can also trigger the same `rc=-10`
-(SIGUSR1) death, since `restart_lock` should have made the poller
-harmless during that exact window. Ideas not yet checked: (a) whether
-`hbot config --json` (called by `read_current_config()` at the top of
-every `do_POST`, outside `restart_lock`) does something more than a plain
-file read; (b) whether the bind-mounted `data/bot/{bot.pid,status.json,
-meta.json,loaded.json}` files — which persist across both `docker
-restart` and full `docker compose up -d` recreation, since `./data` is a
-host bind mount — can leave stale PID references that confuse a fresh
-start when reused low PIDs coincide; (c) whether some external process
-(cron, another shell) sent a signal during testing. None of these were
-isolated with a clean single-variable test before time was called on this
-investigation.
+First fix attempt (`restart_lock`, an in-process lock held only around
+this page's *own* `hbot start` calls) was insufficient: the whole point of
+the semi-automated design is the user runs the restart command in their
+*own terminal*, which an in-process lock can't see or protect. Proven by
+direct A/B test — the exact same manual `hbot stop; hbot start` command
+reliably failed while the poller ran, and reliably succeeded the instant
+it was stopped.
 
-**Also tried and reverted:** switching the container's main process from
-the interactive Hummingbot client to an idle `tail -f /dev/null` host (the
-docker-compose.yml comment's own suggested pattern for CLI-driven usage).
-This made things *worse* (0/4 successes vs. an earlier clean success in
-interactive mode) and was reverted — noted in `~/hummingbot/docker-compose.yml`
-itself so it isn't tried again without new evidence.
+**Real fix:** `bot_boot_age_s()` reads `data/bot/meta.json`'s
+`started_at` via a plain `docker exec cat` (no signal) before every poll.
+If the engine has been up for less than `BOOT_GRACE_S` (12s), the poller
+skips its `hbot status` call entirely that cycle — regardless of who
+started the bot. Confirmed reliable across repeated A/B tests: manual
+`hbot stop; hbot start` in a plain shell command, with the poller actively
+running the whole time, succeeded consistently once this landed (it had
+failed 100% of the time beforehand under the same conditions).
 
-**Current safe state:** the bot is running fine, manually
-started (`HBOT_PASSWORD=$(cat ~/.hbot_keystore_password) hbot start
-conf_paper_bot.yml`), with `status-page` NOT running its control
-endpoints against it (the read-only status view, Task 7b, is unaffected
-by any of this — its poller only reads logs/status of an
-already-stable bot, it doesn't restart anything).
+**Residual, unresolved flakiness:** even with the poller fully
+neutralized, one further manual `hbot stop; hbot start` attempt still
+failed with the same `rc=-10` signature — immediately retrying the same
+command succeeded. This is a second, separate cause (a gap in Hummingbot's
+own stop-then-immediately-start sequencing, unrelated to the poller) that
+was never fully isolated. Given the semi-automated design already expects
+the user to run this command themselves and simply retry on failure, this
+residual issue is accepted as-is rather than pursued further — matches
+Jay's decision note verbatim ("a `hbot start` that fails... just run it
+again").
 
-**Do not build Task 11 (control panel UI) on top of Task 10 until this is
-resolved** — a UI that drives an unreliable restart mechanism will just
-surface the same failures with worse visibility into why. Options for
-Jay to decide between:
-1. Keep debugging cause #2 (isolate `hbot config --json` and the stale
-   `data/bot/` files as separate, single-variable tests).
-2. Ship a reduced version: the control panel writes the new config file
-   and shows the exact `hbot start` command to run manually, instead of
-   restarting automatically — trades away the spec's "fully automated"
-   requirement for something that reliably works today.
-3. File this as a Hummingbot upstream issue (the SIGUSR1-before-handler
-   race, mechanism #1, is a real bug regardless of what else is going on)
-   and wait for a fixed release rather than working around bleeding-edge
-   CLI internals.
+**Net effect:** the control panel is unblocked and safe to build. Restart
+reliability is now meaningfully better than before (one whole confirmed
+cause eliminated) but not perfect — exactly the tradeoff the semi-automated
+decision already accounts for.
 
 ---
 
-### Task 11: Control panel UI (blocked — see known issue above)
+### Task 11: Control panel UI
 
-- [ ] **Step 1: Add pair list + add/remove controls, params form, and start/stop buttons to `PAGE_TEMPLATE`**
+**Built as: semi-automated, per the spec's Phase 1c decision note** — not
+the fully-automated version originally sketched here. Actual implementation
+in `status-page/status_server.py`:
 
-Extend the `refresh()` function's rendered HTML with a new `<section>`
-before "History / PnL":
+- [x] **Pair list (add/remove) + params form (spread/amount/refresh) +
+  Start/Stop buttons**, added to `PAGE_TEMPLATE`. Each control action
+  (`addPair()`, `removePair()`, `applyParams()`, `botAction()`) POSTs to
+  its endpoint via `withBanner()`, which shows a banner during the
+  request, then either renders the returned error or (for pair/param
+  writes) the `manual_command` to run in a `<pre>` block, then refreshes.
+- [x] **Per-pair price badges** replace the old single hardcoded BTC-USDT
+  reference (per the spec's UI note) — `market_prices` is now a dict
+  keyed by whatever pairs are currently active, fetched in one API call
+  per poll cycle.
+- [x] **Live config populates the form** in `refresh()`, skipping any
+  input the user currently has focus in (`document.activeElement !== el`)
+  so a 5s auto-refresh can't stomp on text mid-typing.
+- [x] **Manual browser test**: added a pair, saw the manual command
+  appear; ran it in a real shell with the page's poller actively running
+  the whole time; pair showed up trading within a few seconds. Verified
+  duplicate-pair and out-of-range-spread rejections render inline instead
+  of failing silently.
 
-```html
-<section>
-  <h3>Controls</h3>
-  <div id="banner" class="meta" style="display:none;">Applying changes — bot restarting&hellip;</div>
-  <div id="controlError" class="error" style="display:none;"></div>
-
-  <h4>Trading Pairs</h4>
-  <ul id="pairList"></ul>
-  <input id="newPair" placeholder="e.g. SOL-USDT">
-  <button onclick="addPair()">Add pair</button>
-
-  <h4>Parameters</h4>
-  <label>Bid spread <input id="bidSpread" type="number" step="0.0001"></label>
-  <label>Ask spread <input id="askSpread" type="number" step="0.0001"></label>
-  <label>Order amount <input id="orderAmount" type="number" step="0.001"></label>
-  <label>Refresh time (s) <input id="refreshTime" type="number" step="1"></label>
-  <button onclick="applyParams()">Apply parameters</button>
-
-  <h4>Bot</h4>
-  <button onclick="botAction('start')">Start</button>
-  <button onclick="botAction('stop')">Stop</button>
-</section>
-```
-
-And the corresponding JS (appended after `refresh()`'s definition, before
-`refresh(); setInterval(...)`):
-
-```js
-async function withBanner(fn) {
-  document.getElementById('banner').style.display = 'block';
-  document.getElementById('controlError').style.display = 'none';
-  try {
-    const result = await fn();
-    if (!result.success) {
-      const el = document.getElementById('controlError');
-      el.textContent = result.error || 'Unknown error';
-      el.style.display = 'block';
-    }
-  } finally {
-    document.getElementById('banner').style.display = 'none';
-    refresh();
-  }
-}
-
-async function postJson(path, body) {
-  const res = await fetch(path, { method: 'POST', body: JSON.stringify(body) });
-  return res.json();
-}
-
-function addPair() {
-  const pair = document.getElementById('newPair').value.trim().toUpperCase();
-  if (!pair) return;
-  withBanner(() => postJson('/api/pairs/add', { pair }));
-}
-
-function removePair(pair) {
-  withBanner(() => postJson('/api/pairs/remove', { pair }));
-}
-
-function applyParams() {
-  withBanner(() => postJson('/api/params', {
-    bid_spread: parseFloat(document.getElementById('bidSpread').value),
-    ask_spread: parseFloat(document.getElementById('askSpread').value),
-    order_amount: parseFloat(document.getElementById('orderAmount').value),
-    order_refresh_time: parseInt(document.getElementById('refreshTime').value, 10),
-  }));
-}
-
-function botAction(action) {
-  withBanner(() => postJson(`/api/bot/${action}`, {}));
-}
-```
-
-- [ ] **Step 2: Populate the pair list and param fields from `/api/state` in `refresh()`**
-
-```js
-const cfg = s.config_fields || {};
-document.getElementById('pairList').innerHTML = (cfg.trading_pairs || [])
-  .map(p => `<li>${esc(p)} <button onclick="removePair('${esc(p)}')">remove</button></li>`).join('');
-document.getElementById('bidSpread').value = cfg.bid_spread ?? '';
-document.getElementById('askSpread').value = cfg.ask_spread ?? '';
-document.getElementById('orderAmount').value = cfg.order_amount ?? '';
-document.getElementById('refreshTime').value = cfg.order_refresh_time ?? '';
-```
-
-Only set these `.value`s when the corresponding input isn't currently
-focused (`document.activeElement !== inputEl`), so a 5s auto-refresh
-doesn't stomp on text the user is mid-typing. Wrap each assignment in that
-check.
-
-- [ ] **Step 3: Manual browser test**
-
-Open `http://localhost:8600`, add a pair via the form, confirm the
-"Applying changes" banner appears then clears, and the new pair shows up
-in both the pair list and the Active Orders table within one refresh
-cycle. Try adding a duplicate pair and confirm the error message renders
-instead of silently doing nothing.
-
-- [ ] **Step 4: Commit**
+- [x] **Commit**
 
 ```bash
-git add status-page/status_server.py
-git commit -m "feat: add control panel UI (pairs, params, start/stop) to status-page"
+git add status-page/status_server.py hummingbot-setup-spec.md
+git commit -m "feat: build semi-automated control panel with per-pair prices"
 ```
 
 ---
 
 ### Task 12: Document Phase 1c
 
-- [ ] **Step 1: Update `README.md`**
+- [x] **Step 1: Update `README.md`**
 
-Add a "Control panel" section under "Check status" documenting: pairs and
-params are editable at `http://localhost:8600`, changes restart the bot
-automatically, and the live config is still always readable as plain YAML
-at `~/hummingbot/conf/scripts/conf_paper_bot.yml` (or via `hbot config`) —
-independent of the dashboard, per the spec's requirement that state stay
-inspectable outside the UI.
+Added a "Control panel" section: pairs/params editable at
+`http://localhost:8600`; applying writes and validates the config but
+shows a manual restart command instead of restarting automatically
+(`hummingbot-setup-spec.md` Phase 1c has the why); the live config stays
+readable as plain YAML at `~/hummingbot/conf/scripts/conf_paper_bot.yml`
+independent of the dashboard.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add README.md
