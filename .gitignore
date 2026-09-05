@@ -1,0 +1,14 @@
+# Secrets — never commit these
+.env
+.env.*
+*.key
+keystore*
+
+# Hummingbot config/data if ever referenced from this repo
+conf/
+data/
+logs/
+
+# OS/editor noise
+.DS_Store
+*.swp
