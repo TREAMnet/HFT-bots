@@ -108,6 +108,58 @@ dashboard:**
 
 ---
 
+## Phase 1c: Dashboard controls — multi-pair + strategy management
+
+**Status (Sept 2026): partially built, blocked.** Multi-pair script
+(`multi_pmm.py`) works and is verified. Config read/write + control
+endpoints are written but restart-on-apply is unreliable — root-caused one
+real bug (a signal race between `status-page`'s poller and the engine's
+own startup sequence, now fixed) but a second, unconfirmed cause is still
+failing intermittent restarts. Control panel UI intentionally not built on
+top of this yet. Full writeup and options in the plan doc
+(`docs/superpowers/plans/2026-09-05-hummingbot-setup.md`, Task 10 known
+issue).
+
+**Goal:** Extend the working custom status page (`localhost:8600`) from
+read-only monitoring into a lightweight control panel, so pairs and strategy
+params can be tested without hand-editing config files or the CLI.
+
+**Decided scope:**
+- **Multi-pair setup:** open decision — evaluate whether to run one
+  `simple_pmm`-style bot instance per pair (separate processes) or a single
+  bot/strategy handling multiple pairs, and recommend based on whichever is
+  simpler to implement and monitor given the current architecture. Note the
+  trade-off either way in the write-up (e.g. per-pair isolation and easier
+  individual restart vs. single-process simplicity).
+- **Controls to expose in the dashboard:**
+  - Add / remove trading pairs
+  - Adjust strategy parameters: spread, order size, refresh time
+  - Start / stop the bot(s)
+  - (Explicitly out of scope for now: adjusting paper trade balances —
+    current paper balances are sufficient for testing.)
+- **Apply behavior: fully automated.** Changes made in the dashboard should
+  write the updated config and restart the affected bot process(es)
+  automatically — no manual CLI restart step required.
+
+**Implementation notes / things to watch:**
+- Since this now *writes* config and restarts processes (not just reads
+  logs/status), validate inputs before applying (e.g. reject a duplicate
+  pair, an invalid spread value) rather than letting a bad config crash the
+  bot silently.
+- A restart briefly interrupts the bot's live paper-trading loop — fine for
+  this personal/testing context, but worth a small visible confirmation step
+  in the dashboard ("Applying changes — bot restarting...") rather than a
+  silent action, so it's clear when a change has taken effect.
+- Keep this logic in the `HFT-bots` repo (same as the status page), not
+  inside Hummingbot or hummingbot-api's own code, for the same
+  upgrade-independence reason as Phase 1b.
+- Document any new pairs/params added through the dashboard the same way
+  Phase 1 was documented — so state is recoverable/inspectable outside the
+  UI too (e.g. current live config still readable as a plain file, not only
+  through the dashboard).
+
+---
+
 ## Phase 2 (later, separate task): Condor — AI agent layer
 - Repo: `https://github.com/hummingbot/condor`
 - Condor is an AI agent harness that sits on top of the Hummingbot API — it lets an LLM make trading decisions (entries/exits, parameter adjustments) while Hummingbot executes the actual trades.

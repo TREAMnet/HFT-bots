@@ -33,8 +33,18 @@ ORDER_ROW_RE = re.compile(
     r"^\s*(\S+)\s+(\S+)\s+(buy|sell)\s+([\d.]+)\s+([\d.]+)\s+(\S+)\s*$",
     re.IGNORECASE,
 )
+PAIR_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+$")
+CONFIG_FILE_PATH = "/home/hummingbot/conf/scripts/conf_paper_bot.yml"
 
 state_lock = threading.Lock()
+# `hbot status` sends SIGUSR1 to ask the engine for a fresh snapshot — but the
+# engine only installs a SIGUSR1 handler once it finishes connecting to the
+# exchange (hummingbot/cli/engine.py `_serve()`); before that, SIGUSR1's
+# default disposition kills the process outright. This lock keeps the
+# background poller's `hbot status` calls from ever overlapping a restart's
+# vulnerable boot window — held by apply_config() for the full
+# restart-then-start sequence, checked non-blockingly by poll_loop().
+restart_lock = threading.Lock()
 state = {
     "fetched_at": None,
     "running": False,
@@ -48,6 +58,7 @@ state = {
     "fetch_error": None,
     "market_price": None,
     "market_pair": None,
+    "config_fields": {},
 }
 
 
@@ -87,12 +98,122 @@ def fetch_market_price(api_url: str, user: str, password: str, connector: str, p
         return None
 
 
+def read_secret_file(path: str) -> str:
+    """Reads a raw single-value secret file (not KEY=VALUE), e.g. the
+    Hummingbot keystore password written by `hbot start`'s setup step."""
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
 def run_hbot(container: str, *args: str, timeout: int = 15) -> str:
     result = subprocess.run(
         ["docker", "exec", container, "hbot", *args],
         capture_output=True, text=True, timeout=timeout,
     )
     return result.stdout
+
+
+def read_current_config(container: str) -> dict:
+    raw = run_hbot(container, "config", "--json")
+    data = json.loads(raw)
+    return data.get("strategy", {}).get("fields", {})
+
+
+def validate_fields(fields: dict) -> str:
+    """Mirrors multi_pmm.py's own pydantic validators, so bad input fails
+    fast without ever shelling out to docker. Returns an error string, or
+    an empty string when the fields are valid."""
+    pairs = fields.get("trading_pairs", [])
+    if not pairs:
+        return "trading_pairs must not be empty"
+    if len(set(pairs)) != len(pairs):
+        return "trading_pairs must not contain duplicates"
+    for pair in pairs:
+        if not PAIR_RE.match(pair):
+            return f"invalid trading pair format: {pair!r} (expected e.g. BTC-USDT)"
+    for key in ("bid_spread", "ask_spread"):
+        try:
+            v = float(fields.get(key, 0))
+        except (TypeError, ValueError):
+            return f"{key} must be a number"
+        if not (0 < v < 0.5):
+            return f"{key} must be between 0 and 0.5 (0%-50%)"
+    try:
+        if float(fields.get("order_amount", 0)) <= 0:
+            return "order_amount must be positive"
+    except (TypeError, ValueError):
+        return "order_amount must be a number"
+    try:
+        if int(fields.get("order_refresh_time", 0)) <= 0:
+            return "order_refresh_time must be positive"
+    except (TypeError, ValueError):
+        return "order_refresh_time must be a whole number"
+    return ""
+
+
+def render_yaml(fields: dict) -> str:
+    pairs_block = "\n".join(f"- {p}" for p in fields["trading_pairs"])
+    return (
+        "script_file_name: multi_pmm.py\n"
+        "controllers_config: []\n"
+        f"exchange: {fields['exchange']}\n"
+        "trading_pairs:\n"
+        f"{pairs_block}\n"
+        f"order_amount: {fields['order_amount']}\n"
+        f"bid_spread: {fields['bid_spread']}\n"
+        f"ask_spread: {fields['ask_spread']}\n"
+        f"order_refresh_time: {fields['order_refresh_time']}\n"
+        f"price_type: {fields.get('price_type', 'mid')}\n"
+    )
+
+
+def apply_config(container: str, fields: dict, config_password: str) -> dict:
+    """Write the FULL merged config (fields must already contain every
+    MultiPMMConfig field, not a partial patch), restart the container for a
+    clean process state, then start the strategy. Returns
+    {"success": bool, "error": str}.
+
+    `hbot create --values-stdin` looked like the natural fit, but it
+    refuses to overwrite an existing config name (one-shot, not an
+    upsert) — and `hbot start --replace` against the same still-running
+    interactive container was unreliable (reset to the welcome screen
+    instead of loading the new strategy). Writing the YAML directly and
+    restarting the container is what actually works — see the setup plan.
+    """
+    error = validate_fields(fields)
+    if error:
+        return {"success": False, "error": error}
+
+    write = subprocess.run(
+        ["docker", "exec", "-i", container, "sh", "-c", f"cat > {CONFIG_FILE_PATH}"],
+        input=render_yaml(fields), capture_output=True, text=True, timeout=15,
+    )
+    if write.returncode != 0:
+        return {"success": False, "error": write.stderr.strip() or "failed to write config"}
+
+    # Hold restart_lock for the whole restart+start sequence so the background
+    # poller (poll_loop) can't send a `hbot status` SIGUSR1 into the engine's
+    # vulnerable pre-handler boot window and kill it (see the restart_lock
+    # comment above — this was the actual root cause of every "flaky restart"
+    # symptom seen while building this feature, not a timing issue). `hbot
+    # start`'s own exit code is already the correct readiness signal: it
+    # internally waits for the engine's initial status.json write (a plain
+    # file read, not a signal) before returning, so no extra polling here.
+    with restart_lock:
+        restart = subprocess.run(["docker", "restart", container], capture_output=True, text=True, timeout=30)
+        if restart.returncode != 0:
+            return {"success": False, "error": restart.stderr.strip() or "failed to restart container"}
+
+        start = subprocess.run(
+            ["docker", "exec", "-e", f"HBOT_PASSWORD={config_password}", container, "hbot", "start", "conf_paper_bot.yml"],
+            capture_output=True, text=True, timeout=30,
+        )
+    if start.returncode != 0:
+        return {"success": False, "error": start.stdout.strip() or start.stderr.strip()}
+    return {"success": True, "error": ""}
 
 
 def parse_active_orders(format_status: str):
@@ -120,42 +241,64 @@ def parse_active_orders(format_status: str):
 
 def poll_loop(container: str, interval: float, api_url: str, api_env: str, price_connector: str, price_pair: str):
     while True:
-        snapshot = {
-            "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "running": False, "strategy": None, "uptime_s": None,
-            "error_count": 0, "errors": [], "balances": {},
-            "active_orders": [], "history_text": "", "fetch_error": None,
-            "market_price": None, "market_pair": price_pair,
-        }
+        # `hbot status` sends the engine a signal that's fatal during its boot
+        # window (see the restart_lock comment near its definition) — never
+        # run it while apply_config() is mid-restart. Skip this cycle
+        # entirely rather than partially update state with a mix of fresh
+        # and stale fields.
+        if not restart_lock.acquire(blocking=False):
+            time.sleep(interval)
+            continue
         try:
-            status_raw = run_hbot(container, "status", "--json")
-            status = json.loads(status_raw)
-            snapshot["running"] = status.get("running", False)
-            snapshot["strategy"] = status.get("strategy")
-            snapshot["uptime_s"] = status.get("uptime_s")
-            errors = status.get("errors", {})
-            snapshot["error_count"] = errors.get("count", 0)
-            snapshot["errors"] = errors.get("messages", [])
-            snapshot["balances"] = status.get("balances", {})
-            snapshot["active_orders"] = parse_active_orders(status.get("format_status", ""))
-        except Exception as exc:
-            snapshot["fetch_error"] = f"status: {exc}"
-
-        try:
-            snapshot["history_text"] = run_hbot(container, "history").strip()
-        except Exception as exc:
-            snapshot["history_text"] = ""
-            snapshot["fetch_error"] = (snapshot["fetch_error"] or "") + f" | history: {exc}"
-
-        env = parse_env_file(api_env)
-        snapshot["market_price"] = fetch_market_price(
-            api_url, env.get("USERNAME"), env.get("PASSWORD"), price_connector, price_pair
-        )
+            snapshot = _poll_once(container, api_url, api_env, price_connector, price_pair)
+        finally:
+            restart_lock.release()
 
         with state_lock:
             state.update(snapshot)
 
         time.sleep(interval)
+
+
+def _poll_once(container: str, api_url: str, api_env: str, price_connector: str, price_pair: str) -> dict:
+    snapshot = {
+        "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "running": False, "strategy": None, "uptime_s": None,
+        "error_count": 0, "errors": [], "balances": {},
+        "active_orders": [], "history_text": "", "fetch_error": None,
+        "market_price": None, "market_pair": price_pair,
+        "config_fields": {},
+    }
+    try:
+        status_raw = run_hbot(container, "status", "--json")
+        status = json.loads(status_raw)
+        snapshot["running"] = status.get("running", False)
+        snapshot["strategy"] = status.get("strategy")
+        snapshot["uptime_s"] = status.get("uptime_s")
+        errors = status.get("errors", {})
+        snapshot["error_count"] = errors.get("count", 0)
+        snapshot["errors"] = errors.get("messages", [])
+        snapshot["balances"] = status.get("balances", {})
+        snapshot["active_orders"] = parse_active_orders(status.get("format_status", ""))
+    except Exception as exc:
+        snapshot["fetch_error"] = f"status: {exc}"
+
+    try:
+        snapshot["config_fields"] = read_current_config(container)
+    except Exception:
+        snapshot["config_fields"] = {}
+
+    try:
+        snapshot["history_text"] = run_hbot(container, "history").strip()
+    except Exception as exc:
+        snapshot["history_text"] = ""
+        snapshot["fetch_error"] = (snapshot["fetch_error"] or "") + f" | history: {exc}"
+
+    env = parse_env_file(api_env)
+    snapshot["market_price"] = fetch_market_price(
+        api_url, env.get("USERNAME"), env.get("PASSWORD"), price_connector, price_pair
+    )
+    return snapshot
 
 
 PAGE_TEMPLATE = """<!doctype html>
@@ -249,6 +392,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # keep stdout quiet; state fetch already prints nothing
 
+    def _json_response(self, code: int, obj: dict):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/api/state":
             with state_lock:
@@ -269,6 +420,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            return self._json_response(400, {"success": False, "error": "invalid JSON body"})
+
+        # Read the live config fresh rather than trusting the cached poll
+        # snapshot — that cache can be briefly empty/stale right after the
+        # server starts (or after an out-of-band change), and acting on a
+        # stale copy silently corrupts fields the caller isn't touching.
+        try:
+            current_fields = read_current_config(self.server.container)
+        except Exception:
+            current_fields = {}
+        config_password = read_secret_file(self.server.hbot_password_file)
+        container = self.server.container
+
+        if self.path == "/api/pairs/add":
+            pair = payload.get("pair", "").strip().upper()
+            pairs = current_fields.get("trading_pairs", [])
+            if pair in pairs:
+                return self._json_response(400, {"success": False, "error": f"{pair} is already added"})
+            current_fields["trading_pairs"] = pairs + [pair]
+            result = apply_config(container, current_fields, config_password)
+        elif self.path == "/api/pairs/remove":
+            pair = payload.get("pair", "").strip().upper()
+            current_fields["trading_pairs"] = [p for p in current_fields.get("trading_pairs", []) if p != pair]
+            result = apply_config(container, current_fields, config_password)
+        elif self.path == "/api/params":
+            for key in ("bid_spread", "ask_spread", "order_amount", "order_refresh_time"):
+                if key in payload:
+                    current_fields[key] = payload[key]
+            result = apply_config(container, current_fields, config_password)
+        elif self.path == "/api/bot/stop":
+            r = subprocess.run(["docker", "exec", container, "hbot", "stop"],
+                                capture_output=True, text=True, timeout=15)
+            result = {"success": r.returncode == 0, "error": "" if r.returncode == 0 else r.stdout.strip()}
+        elif self.path == "/api/bot/start":
+            result = apply_config(container, current_fields, config_password)
+        else:
+            return self._json_response(404, {"success": False, "error": "not found"})
+
+        self._json_response(200 if result["success"] else 400, result)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -279,6 +475,8 @@ def main():
     parser.add_argument("--api-env", default="~/hummingbot-api/.env", help="Path to hummingbot-api's .env, for its USERNAME/PASSWORD")
     parser.add_argument("--price-connector", default="binance", help="Connector to read the public reference price from")
     parser.add_argument("--price-pair", default="BTC-USDT", help="Trading pair to show the market price for")
+    parser.add_argument("--hbot-password-file", default="~/.hbot_keystore_password",
+                         help="Path to the raw Hummingbot keystore password, for restart-after-apply")
     args = parser.parse_args()
 
     poller = threading.Thread(
@@ -289,6 +487,8 @@ def main():
     poller.start()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.container = args.container
+    server.hbot_password_file = args.hbot_password_file
     print(f"Status page: http://localhost:{args.port}  (polling container '{args.container}' every {args.interval}s)")
     server.serve_forever()
 

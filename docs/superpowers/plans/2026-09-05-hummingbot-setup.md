@@ -951,7 +951,7 @@ curl -s -X POST http://127.0.0.1:8600/api/pairs/add -d '{"pair":"SOL-USDT"}'   #
 Expected: first call succeeds, `trading_pairs` includes `SOL-USDT`, second
 identical call returns `{"success": false, "error": "SOL-USDT is already added"}`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit** — code committed, but see the known issue below before building Task 11 on top of it.
 
 ```bash
 git add status-page/status_server.py
@@ -960,7 +960,85 @@ git commit -m "feat: add config read/write + POST control endpoints to status-pa
 
 ---
 
-### Task 11: Control panel UI
+**KNOWN ISSUE — restart-after-apply is unreliable, root cause partially confirmed, not fully fixed.**
+
+Extensive debugging (well past the point where the systematic-debugging
+process says to stop guessing and report back) turned up a real, confirmed
+mechanism, and a real, confirmed fix for *one* cause of it — but restarts
+are still failing intermittently even with that fix applied, and a second
+contributing cause was never pinned down. Documenting fully here rather
+than continuing to iterate blindly.
+
+**Confirmed mechanism #1 (fixed):** `hbot status` sends the engine process
+`SIGUSR1` to request a fresh snapshot (`hummingbot/cli/commands/status.py`).
+The engine only installs a handler for that signal once it finishes
+connecting to the exchange, inside `_serve()`
+(`hummingbot/cli/engine.py`) — before that, SIGUSR1's default disposition
+**kills the process**. `status-page`'s own background poller calls `hbot
+status --json` every 5s; if that lands during a freshly-(re)started bot's
+few-second connection window, it kills the bot it's trying to monitor.
+This fully explained the very first round of "flaky restart" symptoms —
+confirmed by watching the bot boot cleanly and stay up indefinitely with
+`status-page` not running at all, then reliably die within seconds of the
+poller running again. **Fix applied:** `restart_lock` in
+`status_server.py` — held by `apply_config()` for the write-config +
+`docker restart` + `hbot start` sequence, checked non-blockingly by
+`poll_loop()`, which skips its cycle entirely rather than risk the signal.
+
+**Unconfirmed cause #2 (not fixed):** even with `restart_lock` in place,
+a `pairs/remove` call through the actual control endpoint still failed —
+the container's `~/hummingbot/logs/logs_conf_paper_bot.log` (the
+structured log `hbot start`'s own error path reads from) never gained a
+single new line across several failed attempts, meaning the child process
+was dying before even reaching Hummingbot's own logging setup — while
+fully manual, isolated tests (no status-page process running at all,
+several seconds' wait) succeeded reliably. This means something *other*
+than `status-page`'s poller can also trigger the same `rc=-10`
+(SIGUSR1) death, since `restart_lock` should have made the poller
+harmless during that exact window. Ideas not yet checked: (a) whether
+`hbot config --json` (called by `read_current_config()` at the top of
+every `do_POST`, outside `restart_lock`) does something more than a plain
+file read; (b) whether the bind-mounted `data/bot/{bot.pid,status.json,
+meta.json,loaded.json}` files — which persist across both `docker
+restart` and full `docker compose up -d` recreation, since `./data` is a
+host bind mount — can leave stale PID references that confuse a fresh
+start when reused low PIDs coincide; (c) whether some external process
+(cron, another shell) sent a signal during testing. None of these were
+isolated with a clean single-variable test before time was called on this
+investigation.
+
+**Also tried and reverted:** switching the container's main process from
+the interactive Hummingbot client to an idle `tail -f /dev/null` host (the
+docker-compose.yml comment's own suggested pattern for CLI-driven usage).
+This made things *worse* (0/4 successes vs. an earlier clean success in
+interactive mode) and was reverted — noted in `~/hummingbot/docker-compose.yml`
+itself so it isn't tried again without new evidence.
+
+**Current safe state:** the bot is running fine, manually
+started (`HBOT_PASSWORD=$(cat ~/.hbot_keystore_password) hbot start
+conf_paper_bot.yml`), with `status-page` NOT running its control
+endpoints against it (the read-only status view, Task 7b, is unaffected
+by any of this — its poller only reads logs/status of an
+already-stable bot, it doesn't restart anything).
+
+**Do not build Task 11 (control panel UI) on top of Task 10 until this is
+resolved** — a UI that drives an unreliable restart mechanism will just
+surface the same failures with worse visibility into why. Options for
+Jay to decide between:
+1. Keep debugging cause #2 (isolate `hbot config --json` and the stale
+   `data/bot/` files as separate, single-variable tests).
+2. Ship a reduced version: the control panel writes the new config file
+   and shows the exact `hbot start` command to run manually, instead of
+   restarting automatically — trades away the spec's "fully automated"
+   requirement for something that reliably works today.
+3. File this as a Hummingbot upstream issue (the SIGUSR1-before-handler
+   race, mechanism #1, is a real bug regardless of what else is going on)
+   and wait for a fixed release rather than working around bleeding-edge
+   CLI internals.
+
+---
+
+### Task 11: Control panel UI (blocked — see known issue above)
 
 - [ ] **Step 1: Add pair list + add/remove controls, params form, and start/stop buttons to `PAGE_TEMPLATE`**
 
