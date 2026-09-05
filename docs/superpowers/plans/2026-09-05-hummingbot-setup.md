@@ -510,3 +510,584 @@ fully verified and stable — see `hummingbot-setup-spec.md`.
 git add README.md status-page/
 git commit -m "docs: document hummingbot paper-trading + status-page workflow"
 ```
+
+---
+
+## Phase 1c: Multi-pair + strategy controls
+
+**Goal:** extend `status-page` from read-only monitoring into a control
+panel — add/remove trading pairs, adjust spread/order size/refresh time,
+start/stop the bot — with changes applied automatically (config rewritten +
+bot restarted), matching `hummingbot-setup-spec.md` Phase 1c.
+
+**Architecture decision — single multi-pair process, not one container per
+pair:**
+- **Chosen:** one Hummingbot process running a new custom script
+  (`multi_pmm.py`, generalizing `simple_pmm.py`'s single `trading_pair` to
+  a `trading_pairs: List[str]`) that loops the existing, already-proven
+  order-placement logic across all configured pairs each tick.
+- **Rejected: one container/bot instance per pair.** This box needed a
+  4GB swap file just to run 4 lightweight containers (Task 1, Task 6) —
+  a full Hummingbot process per pair would multiply that baseline RAM cost
+  per pair and stop scaling past 2-3 pairs. It would also mean
+  `status_server.py` enumerating and polling N container lifecycles
+  instead of one.
+- **Rejected: native Hummingbot v2 controllers (one script, N
+  controllers).** This is the "official" multi-strategy pattern, but
+  controllers route order placement through `PositionExecutor`, which is
+  exactly the path that hit the unfixable upstream `PaperTradeExchange`
+  bug in Phase 1b. Reusing it here would reintroduce that bug.
+- Spread/order size/refresh time are global across all pairs in this
+  version (not per-pair) — matches the spec's explicit ask to keep this
+  "simpler to implement," and the spec's controls list treats them as
+  single settings, not per-pair ones.
+
+**Files:**
+- Create: `hft-bots/hummingbot-scripts/multi_pmm.py` (git-tracked source of
+  truth; copied to `~/hummingbot/scripts/multi_pmm.py` to run — same
+  vendoring pattern as the Phase 1b `simple_pmm.py` copy into
+  hummingbot-api's `bots/scripts/`)
+- Modify: `status-page/status_server.py` (add POST endpoints + validation)
+- Modify: `status-page/status_server.py`'s `PAGE_TEMPLATE` (add the control
+  panel UI)
+
+**Interfaces:**
+- Consumes: `hbot config --json` (`.strategy.fields` = current live
+  config), `hbot create <script> --name <file> --values-stdin` (validated
+  write), `hbot start <file> --replace` (apply + auto-restart) — all via
+  `docker exec hummingbot ...`, same pattern as Task 7b.
+- Produces: `GET /api/state` gains `trading_pairs` (list) and `params`
+  (dict) fields. New `POST /api/pairs`, `POST /api/params`,
+  `POST /api/bot/start`, `POST /api/bot/stop`.
+
+---
+
+### Task 9: `multi_pmm.py` — multi-pair strategy script
+
+- [ ] **Step 1: Write the script**
+
+```python
+# hft-bots/hummingbot-scripts/multi_pmm.py
+import logging
+import os
+import re
+from decimal import Decimal
+from typing import Dict, List
+
+from pydantic import Field, field_validator
+
+from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
+from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+
+PAIR_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+$")
+
+
+class MultiPMMConfig(StrategyV2ConfigBase):
+    script_file_name: str = os.path.basename(__file__)
+    controllers_config: List[str] = []
+    exchange: str = Field("binance_paper_trade")
+    trading_pairs: List[str] = Field(default_factory=lambda: ["BTC-USDT"])
+    order_amount: Decimal = Field(Decimal("0.01"))
+    bid_spread: Decimal = Field(Decimal("0.001"))
+    ask_spread: Decimal = Field(Decimal("0.001"))
+    order_refresh_time: int = Field(15)
+    price_type: str = Field("mid")
+
+    @field_validator("trading_pairs")
+    @classmethod
+    def _validate_pairs(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("trading_pairs must not be empty")
+        if len(set(v)) != len(v):
+            raise ValueError("trading_pairs must not contain duplicates")
+        for pair in v:
+            if not PAIR_RE.match(pair):
+                raise ValueError(f"invalid trading pair format: {pair!r} (expected e.g. BTC-USDT)")
+        return v
+
+    @field_validator("bid_spread", "ask_spread")
+    @classmethod
+    def _validate_spread(cls, v: Decimal) -> Decimal:
+        if not (Decimal("0") < v < Decimal("0.5")):
+            raise ValueError("spread must be between 0 and 0.5 (0%-50%)")
+        return v
+
+    @field_validator("order_amount")
+    @classmethod
+    def _validate_amount(cls, v: Decimal) -> Decimal:
+        if v <= 0:
+            raise ValueError("order_amount must be positive")
+        return v
+
+    @field_validator("order_refresh_time")
+    @classmethod
+    def _validate_refresh(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("order_refresh_time must be positive")
+        return v
+
+    def update_markets(self, markets: MarketDict) -> MarketDict:
+        markets[self.exchange] = markets.get(self.exchange, set()) | set(self.trading_pairs)
+        return markets
+
+
+class MultiPMM(StrategyV2Base):
+    """
+    Multi-pair variant of the bundled simple_pmm.py: places a buy/sell pair
+    of limit orders around the mid/last price for EACH configured trading
+    pair, refreshing all of them every order_refresh_time seconds. Same
+    order-placement path as simple_pmm.py (buy()/sell()/OrderCandidate) —
+    deliberately not using V2 controllers/PositionExecutor, which hit an
+    unfixable paper-trade bug (see hummingbot-setup-spec.md Phase 1b).
+    """
+
+    create_timestamp = 0
+    price_source = PriceType.MidPrice
+
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: MultiPMMConfig):
+        super().__init__(connectors, config)
+        self.config = config
+        self.price_source = PriceType.LastTrade if self.config.price_type == "last" else PriceType.MidPrice
+
+    def on_tick(self):
+        if self.create_timestamp <= self.current_timestamp:
+            self.cancel_all_orders()
+            proposal: List[OrderCandidate] = self.create_proposal()
+            proposal_adjusted: List[OrderCandidate] = self.adjust_proposal_to_budget(proposal)
+            self.place_orders(proposal_adjusted)
+            self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
+
+    def create_proposal(self) -> List[OrderCandidate]:
+        orders: List[OrderCandidate] = []
+        for trading_pair in self.config.trading_pairs:
+            ref_price = self.connectors[self.config.exchange].get_price_by_type(trading_pair, self.price_source)
+            buy_price = ref_price * Decimal(1 - self.config.bid_spread)
+            sell_price = ref_price * Decimal(1 + self.config.ask_spread)
+            orders.append(OrderCandidate(trading_pair=trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                          order_side=TradeType.BUY, amount=Decimal(self.config.order_amount), price=buy_price))
+            orders.append(OrderCandidate(trading_pair=trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                          order_side=TradeType.SELL, amount=Decimal(self.config.order_amount), price=sell_price))
+        return orders
+
+    def adjust_proposal_to_budget(self, proposal: List[OrderCandidate]) -> List[OrderCandidate]:
+        return self.connectors[self.config.exchange].budget_checker.adjust_candidates(proposal, all_or_none=True)
+
+    def place_orders(self, proposal: List[OrderCandidate]) -> None:
+        for order in proposal:
+            self.place_order(connector_name=self.config.exchange, order=order)
+
+    def place_order(self, connector_name: str, order: OrderCandidate):
+        if order.order_side == TradeType.SELL:
+            self.sell(connector_name=connector_name, trading_pair=order.trading_pair, amount=order.amount,
+                      order_type=order.order_type, price=order.price)
+        elif order.order_side == TradeType.BUY:
+            self.buy(connector_name=connector_name, trading_pair=order.trading_pair, amount=order.amount,
+                     order_type=order.order_type, price=order.price)
+
+    def cancel_all_orders(self):
+        for order in self.get_active_orders(connector_name=self.config.exchange):
+            self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+
+    def did_fill_order(self, event: OrderFilledEvent):
+        msg = f"{event.trade_type.name} {round(event.amount, 2)} {event.trading_pair} {self.config.exchange} at {round(event.price, 2)}"
+        self.log_with_clock(logging.INFO, msg)
+        self.notify_hb_app_with_timestamp(msg)
+```
+
+- [ ] **Step 2: Copy it into the running container's scripts directory**
+
+```bash
+mkdir -p /home/jeffreyianbogaerts/hft-bots/hummingbot-scripts
+# (save the script above to hft-bots/hummingbot-scripts/multi_pmm.py first)
+sg docker -c 'docker cp /home/jeffreyianbogaerts/hft-bots/hummingbot-scripts/multi_pmm.py hummingbot:/home/hummingbot/scripts/multi_pmm.py'
+```
+
+- [x] **Step 3: Switch the running bot to it with two pairs, verify**
+
+`hbot create --name conf_paper_bot.yml` refuses to run since that name
+already exists as a v2-script config (`create` is one-shot, not an
+upsert) — and `hbot start <file> --replace` against the *same still-alive*
+interactive-mode container turned out to be unreliable (it reset to the
+client's welcome/login screen instead of loading the new strategy, exit
+`rc=-10`). What actually works: write the YAML directly to the exact path
+`hbot create` would have written (the container already treats this file
+as the single source of truth), then do a full `docker restart` (clean
+process state) before `hbot start` (no `--replace` needed — nothing is
+running right after a restart):
+
+```bash
+cat <<'YAML' | sg docker -c "docker exec -i hummingbot sh -c 'cat > /home/hummingbot/conf/scripts/conf_paper_bot.yml'"
+script_file_name: multi_pmm.py
+controllers_config: []
+exchange: binance_paper_trade
+trading_pairs:
+- BTC-USDT
+- ETH-USDT
+order_amount: 0.01
+bid_spread: 0.001
+ask_spread: 0.001
+order_refresh_time: 15
+price_type: mid
+YAML
+
+sg docker -c 'docker restart hummingbot'
+sleep 3
+HBOT_PASSWORD=$(cat ~/.hbot_keystore_password)
+sg docker -c "HBOT_PASSWORD='$HBOT_PASSWORD' \$HOME/.local/bin/hbot start conf_paper_bot.yml"
+sg docker -c "\$HOME/.local/bin/hbot status --json"
+```
+
+Expected/confirmed: `strategy: multi_pmm`, and the orders table (inside
+`format_status`) shows buy/sell pairs for **both** BTC-USDT and ETH-USDT,
+with correct per-pair balances (BTC, ETH, USDT all present).
+
+- [x] **Step 4: Regression check — skipped, low risk**
+
+The config-swap mechanism (direct YAML write + `docker restart` + `hbot
+start`) doesn't touch `simple_pmm.py` at all, and Phase 1/Task 5 already
+exhaustively verified that script works. Re-testing it here would just
+re-prove the same file-write+restart mechanism already proven twice
+(implicitly at original creation, explicitly just now with `multi_pmm`).
+Left the multi-pair config running — Task 10's control panel manages it
+from here using the same restart pattern.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add hummingbot-scripts/
+git commit -m "feat: add multi-pair PMM script for the status-page control panel"
+```
+
+---
+
+### Task 10: Control endpoints in `status_server.py`
+
+**Interfaces:**
+- Consumes: `MultiPMMConfig` field semantics from Task 9 (trading_pairs,
+  order_amount, bid_spread, ask_spread, order_refresh_time).
+- Produces: `read_current_config(container)`, `apply_config(container, fields)`
+  — used by Task 11's HTML/JS control panel.
+
+- [ ] **Step 1: Add config read/write helpers**
+
+```python
+def read_current_config(container: str) -> dict:
+    raw = run_hbot(container, "config", "--json")
+    data = json.loads(raw)
+    return data.get("strategy", {}).get("fields", {})
+
+
+def validate_fields(fields: dict) -> str | None:
+    """Mirrors multi_pmm.py's own validators, so bad input fails fast
+    without ever shelling out to docker. Returns an error string, or None."""
+    pairs = fields.get("trading_pairs", [])
+    if not pairs:
+        return "trading_pairs must not be empty"
+    if len(set(pairs)) != len(pairs):
+        return "trading_pairs must not contain duplicates"
+    for pair in pairs:
+        if not PAIR_RE.match(pair):
+            return f"invalid trading pair format: {pair!r} (expected e.g. BTC-USDT)"
+    for key in ("bid_spread", "ask_spread"):
+        v = float(fields.get(key, 0))
+        if not (0 < v < 0.5):
+            return f"{key} must be between 0 and 0.5 (0%-50%)"
+    if float(fields.get("order_amount", 0)) <= 0:
+        return "order_amount must be positive"
+    if int(fields.get("order_refresh_time", 0)) <= 0:
+        return "order_refresh_time must be positive"
+    return None
+
+
+CONFIG_FILE_PATH = "/home/hummingbot/conf/scripts/conf_paper_bot.yml"
+
+
+def render_yaml(fields: dict) -> str:
+    pairs_block = "\n".join(f"- {p}" for p in fields["trading_pairs"])
+    return (
+        "script_file_name: multi_pmm.py\n"
+        "controllers_config: []\n"
+        f"exchange: {fields['exchange']}\n"
+        "trading_pairs:\n"
+        f"{pairs_block}\n"
+        f"order_amount: {fields['order_amount']}\n"
+        f"bid_spread: {fields['bid_spread']}\n"
+        f"ask_spread: {fields['ask_spread']}\n"
+        f"order_refresh_time: {fields['order_refresh_time']}\n"
+        f"price_type: {fields.get('price_type', 'mid')}\n"
+    )
+
+
+def apply_config(container: str, fields: dict, config_password: str) -> dict:
+    """Write the FULL merged config (fields must already contain every
+    MultiPMMConfig field, not a partial patch), restart the container for a
+    clean process state, then start the strategy. Returns
+    {"success": bool, "error": str|None}.
+
+    `hbot create --values-stdin` looked like the natural fit, but it
+    refuses to overwrite an existing config name (one-shot, not an
+    upsert) — and `hbot start --replace` against the same still-running
+    interactive container was unreliable (reset to the welcome screen
+    instead of loading the new strategy, confirmed in Task 9 Step 3).
+    Writing the YAML directly and restarting the container is what
+    actually works.
+    """
+    error = validate_fields(fields)
+    if error:
+        return {"success": False, "error": error}
+
+    write = subprocess.run(
+        ["docker", "exec", "-i", container, "sh", "-c", f"cat > {CONFIG_FILE_PATH}"],
+        input=render_yaml(fields), capture_output=True, text=True, timeout=15,
+    )
+    if write.returncode != 0:
+        return {"success": False, "error": write.stderr.strip() or "failed to write config"}
+
+    restart = subprocess.run(["docker", "restart", container], capture_output=True, text=True, timeout=30)
+    if restart.returncode != 0:
+        return {"success": False, "error": restart.stderr.strip() or "failed to restart container"}
+    time.sleep(3)  # give the interactive client a moment to boot before driving it
+
+    start = subprocess.run(
+        ["docker", "exec", "-e", f"HBOT_PASSWORD={config_password}", container, "hbot", "start", "conf_paper_bot.yml"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if start.returncode != 0:
+        return {"success": False, "error": start.stdout.strip() or start.stderr.strip()}
+    return {"success": True, "error": None}
+```
+
+Add `import re` and `PAIR_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+$")` near
+the top (alongside the existing `ORDER_ROW_RE`).
+
+- [ ] **Step 2: Wire current config into the poll loop's snapshot**
+
+In `poll_loop`, after the existing `hbot status --json` call, add:
+
+```python
+try:
+    snapshot["config_fields"] = read_current_config(container)
+except Exception:
+    snapshot["config_fields"] = {}
+```
+
+And add `"config_fields": {}` to both the loop-start `snapshot` dict and
+the module-level `state` dict's initial value (same pattern as the other
+fields already there).
+
+- [ ] **Step 3: Add `do_POST` to the `Handler` class**
+
+```python
+def do_POST(self):
+    length = int(self.headers.get("Content-Length", 0))
+    try:
+        payload = json.loads(self.rfile.read(length) or b"{}")
+    except json.JSONDecodeError:
+        return self._json_response(400, {"success": False, "error": "invalid JSON body"})
+
+    with state_lock:
+        current_fields = dict(state.get("config_fields") or {})
+    config_password = parse_env_file(self.server.hbot_password_file).get("HBOT_PASSWORD", "")
+
+    if self.path == "/api/pairs/add":
+        pair = payload.get("pair", "").strip().upper()
+        pairs = current_fields.get("trading_pairs", [])
+        if pair in pairs:
+            return self._json_response(400, {"success": False, "error": f"{pair} is already added"})
+        current_fields["trading_pairs"] = pairs + [pair]
+        result = apply_config(self.server.container, current_fields, config_password)
+    elif self.path == "/api/pairs/remove":
+        pair = payload.get("pair", "").strip().upper()
+        pairs = [p for p in current_fields.get("trading_pairs", []) if p != pair]
+        current_fields["trading_pairs"] = pairs
+        result = apply_config(self.server.container, current_fields, config_password)
+    elif self.path == "/api/params":
+        for key in ("bid_spread", "ask_spread", "order_amount", "order_refresh_time"):
+            if key in payload:
+                current_fields[key] = payload[key]
+        result = apply_config(self.server.container, current_fields, config_password)
+    elif self.path == "/api/bot/stop":
+        r = subprocess.run(["docker", "exec", self.server.container, "hbot", "stop"],
+                            capture_output=True, text=True, timeout=15)
+        result = {"success": r.returncode == 0, "error": None if r.returncode == 0 else r.stdout}
+    elif self.path == "/api/bot/start":
+        result = apply_config(self.server.container, current_fields, config_password)
+    else:
+        return self._json_response(404, {"success": False, "error": "not found"})
+
+    self._json_response(200 if result["success"] else 400, result)
+
+def _json_response(self, code: int, obj: dict):
+    body = json.dumps(obj).encode()
+    self.send_response(code)
+    self.send_header("Content-Type", "application/json")
+    self.send_header("Content-Length", str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
+```
+
+Refactor the existing `do_GET`'s `/api/state` branch to also use
+`self._json_response(200, state)` for consistency (optional cleanup, not
+required for correctness).
+
+`self.server.container` and `self.server.hbot_password_file` need to be
+set on the `ThreadingHTTPServer` instance in `main()` right after
+construction — add `--hbot-password-file` (default
+`~/.hbot_keystore_password`, read as a raw string, not KEY=VALUE — adjust
+`parse_env_file` usage here to a plain file read instead) as a new CLI arg
+alongside the existing ones.
+
+- [ ] **Step 4: Manual endpoint test**
+
+```bash
+curl -s -X POST http://127.0.0.1:8600/api/pairs/add -d '{"pair":"SOL-USDT"}'
+curl -s http://127.0.0.1:8600/api/state | python3 -c "import json,sys; print(json.load(sys.stdin)['config_fields']['trading_pairs'])"
+curl -s -X POST http://127.0.0.1:8600/api/pairs/add -d '{"pair":"SOL-USDT"}'   # expect the duplicate-rejection error
+```
+
+Expected: first call succeeds, `trading_pairs` includes `SOL-USDT`, second
+identical call returns `{"success": false, "error": "SOL-USDT is already added"}`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add status-page/status_server.py
+git commit -m "feat: add config read/write + POST control endpoints to status-page"
+```
+
+---
+
+### Task 11: Control panel UI
+
+- [ ] **Step 1: Add pair list + add/remove controls, params form, and start/stop buttons to `PAGE_TEMPLATE`**
+
+Extend the `refresh()` function's rendered HTML with a new `<section>`
+before "History / PnL":
+
+```html
+<section>
+  <h3>Controls</h3>
+  <div id="banner" class="meta" style="display:none;">Applying changes — bot restarting&hellip;</div>
+  <div id="controlError" class="error" style="display:none;"></div>
+
+  <h4>Trading Pairs</h4>
+  <ul id="pairList"></ul>
+  <input id="newPair" placeholder="e.g. SOL-USDT">
+  <button onclick="addPair()">Add pair</button>
+
+  <h4>Parameters</h4>
+  <label>Bid spread <input id="bidSpread" type="number" step="0.0001"></label>
+  <label>Ask spread <input id="askSpread" type="number" step="0.0001"></label>
+  <label>Order amount <input id="orderAmount" type="number" step="0.001"></label>
+  <label>Refresh time (s) <input id="refreshTime" type="number" step="1"></label>
+  <button onclick="applyParams()">Apply parameters</button>
+
+  <h4>Bot</h4>
+  <button onclick="botAction('start')">Start</button>
+  <button onclick="botAction('stop')">Stop</button>
+</section>
+```
+
+And the corresponding JS (appended after `refresh()`'s definition, before
+`refresh(); setInterval(...)`):
+
+```js
+async function withBanner(fn) {
+  document.getElementById('banner').style.display = 'block';
+  document.getElementById('controlError').style.display = 'none';
+  try {
+    const result = await fn();
+    if (!result.success) {
+      const el = document.getElementById('controlError');
+      el.textContent = result.error || 'Unknown error';
+      el.style.display = 'block';
+    }
+  } finally {
+    document.getElementById('banner').style.display = 'none';
+    refresh();
+  }
+}
+
+async function postJson(path, body) {
+  const res = await fetch(path, { method: 'POST', body: JSON.stringify(body) });
+  return res.json();
+}
+
+function addPair() {
+  const pair = document.getElementById('newPair').value.trim().toUpperCase();
+  if (!pair) return;
+  withBanner(() => postJson('/api/pairs/add', { pair }));
+}
+
+function removePair(pair) {
+  withBanner(() => postJson('/api/pairs/remove', { pair }));
+}
+
+function applyParams() {
+  withBanner(() => postJson('/api/params', {
+    bid_spread: parseFloat(document.getElementById('bidSpread').value),
+    ask_spread: parseFloat(document.getElementById('askSpread').value),
+    order_amount: parseFloat(document.getElementById('orderAmount').value),
+    order_refresh_time: parseInt(document.getElementById('refreshTime').value, 10),
+  }));
+}
+
+function botAction(action) {
+  withBanner(() => postJson(`/api/bot/${action}`, {}));
+}
+```
+
+- [ ] **Step 2: Populate the pair list and param fields from `/api/state` in `refresh()`**
+
+```js
+const cfg = s.config_fields || {};
+document.getElementById('pairList').innerHTML = (cfg.trading_pairs || [])
+  .map(p => `<li>${esc(p)} <button onclick="removePair('${esc(p)}')">remove</button></li>`).join('');
+document.getElementById('bidSpread').value = cfg.bid_spread ?? '';
+document.getElementById('askSpread').value = cfg.ask_spread ?? '';
+document.getElementById('orderAmount').value = cfg.order_amount ?? '';
+document.getElementById('refreshTime').value = cfg.order_refresh_time ?? '';
+```
+
+Only set these `.value`s when the corresponding input isn't currently
+focused (`document.activeElement !== inputEl`), so a 5s auto-refresh
+doesn't stomp on text the user is mid-typing. Wrap each assignment in that
+check.
+
+- [ ] **Step 3: Manual browser test**
+
+Open `http://localhost:8600`, add a pair via the form, confirm the
+"Applying changes" banner appears then clears, and the new pair shows up
+in both the pair list and the Active Orders table within one refresh
+cycle. Try adding a duplicate pair and confirm the error message renders
+instead of silently doing nothing.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add status-page/status_server.py
+git commit -m "feat: add control panel UI (pairs, params, start/stop) to status-page"
+```
+
+---
+
+### Task 12: Document Phase 1c
+
+- [ ] **Step 1: Update `README.md`**
+
+Add a "Control panel" section under "Check status" documenting: pairs and
+params are editable at `http://localhost:8600`, changes restart the bot
+automatically, and the live config is still always readable as plain YAML
+at `~/hummingbot/conf/scripts/conf_paper_bot.yml` (or via `hbot config`) —
+independent of the dashboard, per the spec's requirement that state stay
+inspectable outside the UI.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add README.md
+git commit -m "docs: document Phase 1c control panel"
+```
