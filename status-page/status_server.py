@@ -412,6 +412,39 @@ Keeping them outside the regenerated block means refresh() can't touch them.
   <pre id="manualCommandText"></pre>
 </div>
 
+<!--
+The Controls section lives outside #app for the same reason as the feedback
+elements above, and it's not optional here the way it was for those: every
+refresh() (each poll tick, not just control actions) was destroying and
+recreating this section's inputs wholesale via #app's innerHTML replace,
+which silently wiped whatever the user was mid-typing into newPair/bidSpread/
+askSpread/orderAmount/refreshTime — the setIfIdle() focus guard below looks
+right but can never work against a node that gets replaced out from under it
+every 5s, since the freshly-created node was never the focused one. Keeping
+these inputs outside #app means the SAME node persists across refreshes, so
+setIfIdle's focus check is actually checking something real. See
+hummingbot-setup-spec.md Phase 1c (screen-recording follow-up) for the report.
+-->
+<section class="controls">
+  <h3>Controls</h3>
+
+  <h4>Trading Pairs</h4>
+  <ul id="pairList"></ul>
+  <input id="newPair" type="text" placeholder="e.g. SOL-USDT">
+  <button onclick="addPair()">Add pair</button>
+
+  <h4>Parameters</h4>
+  <label>Bid spread <input id="bidSpread" type="number" step="0.0001"></label>
+  <label>Ask spread <input id="askSpread" type="number" step="0.0001"></label>
+  <label>Order amount <input id="orderAmount" type="number" step="0.001"></label>
+  <label>Refresh time (s) <input id="refreshTime" type="number" step="1"></label>
+  <div><button onclick="applyParams()">Write parameters</button></div>
+
+  <h4>Bot</h4>
+  <button onclick="botAction('start')">Start</button>
+  <button onclick="botAction('stop')">Stop</button>
+</section>
+
 <script>
 function esc(s) { return (s ?? "").toString().replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
@@ -462,26 +495,6 @@ async function refresh() {
     <section>
       <h3>History / PnL</h3>
       <pre>${esc(s.history_text) || 'No trades found.'}</pre>
-    </section>
-
-    <section class="controls">
-      <h3>Controls</h3>
-
-      <h4>Trading Pairs</h4>
-      <ul id="pairList"></ul>
-      <input id="newPair" type="text" placeholder="e.g. SOL-USDT">
-      <button onclick="addPair()">Add pair</button>
-
-      <h4>Parameters</h4>
-      <label>Bid spread <input id="bidSpread" type="number" step="0.0001"></label>
-      <label>Ask spread <input id="askSpread" type="number" step="0.0001"></label>
-      <label>Order amount <input id="orderAmount" type="number" step="0.001"></label>
-      <label>Refresh time (s) <input id="refreshTime" type="number" step="1"></label>
-      <div><button onclick="applyParams()">Write parameters</button></div>
-
-      <h4>Bot</h4>
-      <button onclick="botAction('start')">Start</button>
-      <button onclick="botAction('stop')">Stop</button>
     </section>
 
     <section>

@@ -110,62 +110,42 @@ dashboard:**
 
 ## Phase 1c: Dashboard controls — multi-pair + strategy management (regression fixed — see below)
 
-> ✅ **Regression resolved (Sept 2026).** Investigated as two independent
-> root causes, per the systematic-debugging process (evidence gathered
-> before any fix was attempted):
+> ✅ **Regression resolved (Sept 2026), in three rounds.** Phase 1c was
+> marked complete after verified testing, then broke, then took three
+> passes to fully fix — each prior "fix" was real but incomplete, so it's
+> worth recording why each one wasn't the full story:
 >
-> 1. **`http://localhost:8600/` stopped loading.** Confirmed via
->    `docker inspect hummingbot`: the bot container had exited (`143` =
->    SIGTERM, no error/shutdown log lines — an external kill, not an
->    internal crash) and had `RestartPolicy: no`, unlike the other three
->    service containers (`hummingbot-api`, postgres, broker), which all run
->    `unless-stopped` and had already auto-recovered. `status_server.py`
->    itself was a plain foreground process with no supervisor at all — no
->    systemd unit, no nohup log — so once its terminal/session went away it
->    simply never came back; there was no crash to find in its logs because
->    it had no logs. Fixed by matching the bot container's restart policy
->    to its siblings (`docker update --restart unless-stopped hummingbot`)
->    and running `status_server.py` under a `systemd --user` service
->    (`hft-status-page.service`, `Restart=on-failure`, enabled with
->    lingering so it starts on boot without a login session).
-> 2. **Control buttons no-op'd — two stacked causes, found in two passes.**
->    First pass fixed a real bug but didn't fully resolve the symptom, so
->    it needed a second investigation round rather than assuming done:
->    - **UI-wipe bug (first pass):** `withBanner()` writes the
->      confirmation/error text into `#banner` / `#controlError` /
->      `#manualCommand`, but those elements lived inside the `#app` div
->      that `refresh()` fully regenerates — and `withBanner()`'s own
->      `finally` block calls `refresh()` immediately after showing that
->      text, wiping it. Fixed by moving those three elements out of
->      `#app`, as static siblings `refresh()` never touches.
->    - **~5s hidden latency (second pass, found only by actually driving
->      the real page's JS against the live server in a real DOM — see
->      below):** with the UI-wipe fixed, every control action still took
->      **~4.3-5s** to show anything, with the input field clearing at
->      ~4s but the manual command not appearing until ~1-2s after that —
->      long enough, with no progress indication beyond a static
->      "Writing config…" label, to read as a hang or a no-op. Isolated
->      with `time docker exec hummingbot hbot config --json` (~4-5s,
->      every time) vs. `time docker exec hummingbot cat
->      conf_paper_bot.yml` (~0.15-0.3s): `read_current_config()` — called
->      at the top of *every* control POST to merge a partial change into
->      the full config before writing — was shelling out to the `hbot`
->      CLI, which pays a multi-second cold Python-interpreter-startup
->      cost on every single invocation. Fixed by reading the config file
->      straight off disk instead (a minimal decoder for the exact format
->      `render_yaml()` writes, not a general YAML parser — safe since
->      that's the only writer of this file). Round trip is now ~0.3-0.5s.
+> 1. **UI-wipe bug.** The confirmation/error banner lived inside `#app`,
+>    which `refresh()` regenerates wholesale — wiping the message before
+>    it rendered. Fixed by moving those elements outside `#app`. Verified
+>    only via `curl` at the time, which is exactly why it didn't catch
+>    round 2.
+> 2. **~5s hidden latency.** Every control request called
+>    `read_current_config()`, which shelled out to `hbot config --json` —
+>    a ~4-5s CLI cold-start on every single call, vs. ~0.2s for a plain
+>    `docker exec ... cat` of the same file. Fixed by reading the config
+>    file directly. Round trip: ~5s → ~0.3-0.5s.
+> 3. **Poller wiping in-progress input (found via screen recording,
+>    Sept 5, 2026).** Despite both fixes above, typing into any control
+>    field was still getting silently wiped within ~2-3s, before any
+>    button was clicked. Root cause: the *same* `#app.innerHTML` full
+>    regeneration from bug #1 was also destroying and recreating the
+>    Trading Pairs and Parameters inputs on every poll tick (not just
+>    control actions) — including the one under the user's cursor. A
+>    `setIfIdle()` focus guard already existed and looked correct, but
+>    could never work: it checked `document.activeElement !== el` against
+>    a node that had just been replaced, so the "currently focused"
+>    element could never match. The `newPair` field had no guard at all.
+>    Fixed by moving the entire Controls section outside `#app`, same
+>    pattern as bug #1 — the input nodes now persist across refreshes, so
+>    the focus check is actually checking something real.
 >
-> Both fixes are in `status-page/status_server.py`. Verification for the
-> second pass specifically used a real DOM (Node + jsdom) driving the
-> actual served page's JS against the live server — sampling the DOM at
-> intervals after a simulated click — rather than curl alone, since curl
-> can't see what the *page* renders or when; that's what caught the
-> latency issue the first pass's curl-only verification missed. Also
-> re-verified: bot restarted and trading (`hbot status --json` shows
-> `running: true`, live orders), dashboard loads at `localhost:8600`, and
-> `/api/pairs/add` + `/api/pairs/remove` both write and validate correctly
-> and now render their confirmation within well under a second.
+> Round 3 was verified differently on purpose, after round 1's curl-only
+> verification proved insufficient: a real DOM (Node + jsdom) driving the
+> actual served page's JS against the live server, simulating focus and
+> typing exactly like a browser, sampled across repeated poll ticks. That
+> caught what curl structurally cannot see — what's rendered, when, and
+> whether a specific DOM node survives a refresh.
 
 **Status: done and verified (Sept 2026).** Control panel live at
 `http://localhost:8600`.
@@ -217,6 +197,28 @@ params can be tested without hand-editing config files or the CLI.
 > pair**, not stay hardcoded to BTC-USD — each added pair should get its own
 > price visual on the dashboard, and it should disappear/appear as pairs are
 > removed/added.
+
+> ⚠ **UI note (added Sept 2026): amounts should display in USDT, not base
+> asset.** Currently the active orders list, bid/ask order rows, and the
+> "Order amount" control field all show quantities in the pair's base asset
+> (e.g. BTC for BTC-USDT) — this is confirmed by Jay's observation and makes
+> cross-pair comparison meaningless once multiple pairs are active (0.01 BTC
+> vs. 0.1 ETH aren't comparable at a glance; $50 USDT is). Change all three
+> to show/accept USDT amounts instead.
+>
+> **Implementation note:** this is not just a label swap. Hummingbot's PMM
+> `order_amount` parameter is normally denominated in the **base asset**
+> (BTC, ETH, etc.), not the quote currency. Converting to/from USDT requires
+> the current market price at the time of display or input:
+> - **Display (active orders, order rows):** convert base-asset amount →
+>   USDT using the live price already being fetched for the price badges.
+> - **Input (Order amount field):** convert the USDT value the user types
+>   back into the base-asset amount before writing it into the strategy
+>   config — Hummingbot itself still needs the base-asset number under the
+>   hood, since that's what `order_amount` expects.
+> - Be explicit in the UI about which pair's price a given order-amount
+>   input is being converted at, if the same "Order amount" field applies
+>   across multiple pairs with different prices.
 - **Apply behavior: semi-automated (decided Sept 2026, see note below).**
   Dashboard writes the updated config and validates input as originally
   planned, but does **not** attempt to restart the bot process itself.
