@@ -59,6 +59,55 @@ So the setup can be repeated without re-deriving the steps.
 
 ---
 
+## Phase 1b: Dashboard limitation — decision & lightweight status page
+
+**Findings (confirmed via logs, Sept 2026):**
+- Controller-based deploy (what hummingbot-api's dashboard Deploy page uses by
+  default) is what the dashboard's status/PnL panel is built for, but it hits an
+  upstream Hummingbot bug: `PaperTradeExchange object has no attribute
+  'trading_rules'`. Bot reports "running" but every order-placement attempt
+  throws that AttributeError — it never actually places a paper order.
+- Script-based deploy (`simple_pmm.py`, same script proven working in Phase 1
+  step 2) trades correctly — placing and refreshing real simulated orders — but
+  hummingbot-api's "running" status is hardcoded to require controller
+  performance reports over MQTT, which a plain script never sends. So it will
+  always show as "stopped" with an empty PnL panel in the dashboard, even
+  though it's genuinely trading.
+- Ruled out: patching the vendored `PaperTradeExchange`/`trading_rules` bug
+  inside the Docker image. Too invasive for a personal project — an image
+  update could silently re-break it, requiring a full re-diagnosis each time.
+
+**Decision:** Keep the working script bot (`simple_pmm.py`) running as-is.
+Treat the official hummingbot-api dashboard as **unreliable for this setup**
+and stop relying on it for status/PnL — do not spend further effort making
+controller-based paper trading work on the current hummingbot-api version.
+
+**Next step — build a lightweight custom status page instead of the full
+dashboard:**
+- Purpose: just show what the bot is doing (not full PnL analytics, not the
+  Hummingbot Dashboard's feature set).
+- Source of truth — check both, use whichever is more reliable:
+  1. hummingbot-api's generic container/instance endpoints (running/uptime/raw
+     logs), if they work independently of the broken controller-performance
+     panel.
+  2. Tailing/parsing the script bot's own log output (order placements,
+     cancellations, fills, balances) if the API doesn't expose this cleanly.
+- Minimum content: is the bot running + uptime, current active orders
+  (price/size), recent fills/trade history, and PnL.
+  - PnL isn't reported by the script bot the way the dashboard's controller
+    panel expects it (that's the MQTT path that's broken/unavailable here) —
+    so this likely needs to be computed rather than read off an existing
+    field: derive it from the fill/trade history (entry vs. exit prices,
+    realized PnL on closed trades) plus current position vs. current market
+    price for unrealized PnL. Confirm what data is actually available in the
+    log/API output before deciding the exact calculation.
+- Simple local web view, auto-refreshing on a short poll interval — no need
+  for anything elaborate.
+- Lives in this repo (`HFT-bots`), not inside the Hummingbot or hummingbot-api
+  codebases — keeps it independent of upstream image updates.
+
+---
+
 ## Phase 2 (later, separate task): Condor — AI agent layer
 - Repo: `https://github.com/hummingbot/condor`
 - Condor is an AI agent harness that sits on top of the Hummingbot API — it lets an LLM make trading decisions (entries/exits, parameter adjustments) while Hummingbot executes the actual trades.

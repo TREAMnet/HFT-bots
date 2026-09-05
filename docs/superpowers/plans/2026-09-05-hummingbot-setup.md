@@ -67,12 +67,12 @@ Expected: `Swap:` row now shows `4.0Gi` total, `0B` used.
 **Interfaces:**
 - Produces: an initialized git repo at `hft-bots/` that every later task's commits land in.
 
-- [ ] **Step 1: Initialize the repo**
+- [x] **Step 1: Initialize the repo**
 
 Run: `git init` (from `/home/jeffreyianbogaerts/hft-bots`)
 Expected: `Initialized empty Git repository in .../hft-bots/.git/`
 
-- [ ] **Step 2: Write `.gitignore`**
+- [x] **Step 2: Write `.gitignore`**
 
 ```
 # Secrets — never commit these
@@ -91,12 +91,12 @@ logs/
 *.swp
 ```
 
-- [ ] **Step 3: Verify status**
+- [x] **Step 3: Verify status**
 
 Run: `git status`
 Expected: `.gitignore` and `hummingbot-setup-spec.md` listed as untracked (new) files; no ignored paths shown. `CLAUDE.md` is deliberately left out of this task — see the note in the final summary; do not commit it here.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add .gitignore hummingbot-setup-spec.md
@@ -109,16 +109,16 @@ git commit -m "chore: initialize repo with .gitignore before first commit"
 
 **Files:** none (host packages only)
 
-- [ ] **Step 1: Update apt and install Docker from Debian's own repos**
+- [x] **Step 1: Update apt and install Docker from Debian's own repos**
 
-Debian trixie is very new — use the in-distro packages rather than Docker's own apt repo, which may not yet publish a `trixie` channel:
+Debian trixie is very new — use the in-distro packages rather than Docker's own apt repo, which may not yet publish a `trixie` channel. Note: the package is called `docker-compose` in Debian's repos, not `docker-compose-v2` — but it's actually Compose v2.26.1 (wires up as the `docker compose` plugin), not legacy v1:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-v2 docker-buildx uidmap
+sudo apt-get install -y docker.io docker-compose docker-buildx uidmap
 ```
 
-- [ ] **Step 2: Enable and start the daemon**
+- [x] **Step 2: Enable and start the daemon**
 
 ```bash
 sudo systemctl enable --now docker
@@ -126,18 +126,18 @@ sudo systemctl enable --now docker
 
 Expected: `systemctl status docker` shows `active (running)`.
 
-- [ ] **Step 3: Let your user run docker without sudo**
+- [x] **Step 3: Let your user run docker without sudo**
 
 ```bash
 sudo usermod -aG docker "$USER"
 ```
 
-Group membership needs a new login session to take effect. For the rest of this plan, either open a fresh shell/`newgrp docker`, or prefix commands with `sudo` if `docker ...` reports a permission error.
+Group membership needs a new login session to take effect. For the rest of this plan, either open a fresh shell, or use `sg docker -c '<command>'` to run a single command with the new group applied without logging out.
 
-- [ ] **Step 4: Verify Docker works end-to-end (daemon + network pull)**
+- [x] **Step 4: Verify Docker works end-to-end (daemon + network pull)**
 
-Run: `docker run --rm hello-world` (or `sudo docker run --rm hello-world` if group membership hasn't applied yet)
-Expected: output includes `Hello from Docker!`
+Run: `sg docker -c 'docker run --rm hello-world'`
+Expected: output includes `Hello from Docker!` — confirmed, including the image pull over the network.
 
 (No git commit — no repo file changed.)
 
@@ -147,37 +147,41 @@ Expected: output includes `Hello from Docker!`
 
 **Files:** none in `hft-bots` — Hummingbot clones to `~/hummingbot`, outside this repo per the spec.
 
-- [ ] **Step 1: Clone**
+- [x] **Step 1: Clone**
 
 ```bash
 git clone https://github.com/hummingbot/hummingbot.git ~/hummingbot
 ```
 
-- [ ] **Step 2: Docker setup**
+- [x] **Step 2: Docker setup**
 
 ```bash
 cd ~/hummingbot
-make setup
+echo n | sg docker -c 'make setup'
 ```
 
-When prompted about including **Gateway** (DEX middleware), answer **`n`** — we're only paper-trading against a centralized exchange (`binance_paper_trade`), Gateway isn't needed, and skipping it saves RAM on this box.
+Answered **`n`** to the "Include Gateway?" prompt (DEX middleware) — we're only paper-trading against a centralized exchange (`binance_paper_trade`), Gateway isn't needed, and skipping it saves RAM on this box. (`sg docker -c '...'` is needed for every docker command this session since group membership from Task 3 doesn't apply until a fresh login shell.)
 
-- [ ] **Step 3: Deploy the container**
+- [x] **Step 3: Deploy the container**
 
 ```bash
-make deploy
+sg docker -c 'make deploy'
 ```
 
-- [ ] **Step 4: Link the `hbot` CLI onto the host PATH**
+Pulls `hummingbot/hummingbot:latest` (prebuilt image, no local build) and starts it with `network_mode: host`.
+
+- [x] **Step 4: Link the `hbot` CLI onto the host PATH**
 
 ```bash
-make link-cli
+sg docker -c 'make link-cli'
 ```
 
-- [ ] **Step 5: Verify**
+Linked to `~/.local/bin/hbot` — make sure that's on `PATH`.
 
-Run: `hbot --help`
-Expected: prints Hummingbot's CLI usage/help text (confirms the wrapper reaches the running container).
+- [x] **Step 5: Verify**
+
+Run: `sg docker -c 'hbot --help'`
+Expected: prints Hummingbot's CLI usage/help text (confirms the wrapper reaches the running container) — confirmed.
 
 (No git commit — Hummingbot's codebase never enters `hft-bots`.)
 
@@ -190,33 +194,45 @@ Expected: prints Hummingbot's CLI usage/help text (confirms the wrapper reaches 
 **Interfaces:**
 - Consumes: working `hbot` CLI from Task 4.
 
-- [ ] **Step 1: Create the strategy config**
+- [x] **Step 1: Create the strategy config**
+
+`simple_pmm` is a V2 script (`scripts/simple_pmm.py` in the image) with defaults for everything except exchange/trading_pair (`order_amount=0.01`, `bid_spread`/`ask_spread=0.001`, `order_refresh_time=15`, `price_type=mid`), so no further prompts appear:
 
 ```bash
-hbot create simple_pmm --name conf_paper_bot.yml \
-     --set exchange=binance_paper_trade --set trading_pair=BTC-USDT
+sg docker -c "$HOME/.local/bin/hbot create simple_pmm --name conf_paper_bot.yml \
+     --set exchange=binance_paper_trade --set trading_pair=BTC-USDT"
 ```
 
-If the wizard prompts further for strategy parameters not covered by `--set`, use these concrete values: `bid_spread=0.5`, `ask_spread=0.5`, `order_refresh_time=60`, `order_amount=0.01`. Accept the default price source (current market price).
+Expected/confirmed: `## created v2-script/conf_paper_bot.yml` with `ready: yes`.
 
-- [ ] **Step 2: Start it**
+- [x] **Step 2: Start it**
+
+First attempt fails with `Error: no password provided (code 4)` — Hummingbot encrypts its local keystore with a password even for paper trading (no exchange keys needed, but the client itself is protected; this is exactly the "Hummingbot's encrypted keystore / password" secret the spec's Secrets section calls out). Generate one, store it **outside this repo**, and pass it via `HBOT_PASSWORD`:
 
 ```bash
-hbot start conf_paper_bot.yml
+HBOT_PASSWORD=$(openssl rand -base64 24)
+echo "$HBOT_PASSWORD" > ~/.hbot_keystore_password
+chmod 600 ~/.hbot_keystore_password
+sg docker -c "HBOT_PASSWORD='$HBOT_PASSWORD' $HOME/.local/bin/hbot start conf_paper_bot.yml"
 ```
 
-- [ ] **Step 3: Confirm simulated activity**
+Expected/confirmed: `## start` — `status: running`.
+
+- [x] **Step 3: Confirm simulated activity**
 
 ```bash
-hbot status
+sg docker -c "$HOME/.local/bin/hbot status"
 ```
 
-Expected: status output shows the strategy running, simulated balances for the paper-trade account, and active buy/sell orders around the current BTC-USDT market price.
+Expected: status output shows the strategy running, simulated balances for the paper-trade account, and active buy/sell orders around the current BTC-USDT market price. Confirmed — e.g. `1 BTC` / `100000 USDT` simulated balances, live buy/sell orders at ~$79.6-79.8k around the real BTC-USDT mid price.
 
-- [ ] **Step 4: Stop it to free RAM before the next tasks**
+- [x] **Step 4: Stop it to free RAM before the next tasks**
 
-Inside the `hbot` session: `stop`, then exit the CLI (`exit`).
-Expected: `hbot status` (run again) reports the strategy is no longer active.
+```bash
+sg docker -c "$HOME/.local/bin/hbot stop"
+```
+
+Expected: `## stop` — `stopped: yes`; a follow-up `hbot status` reports `state: stopped`. Confirmed.
 
 (No git commit — this is a runtime verification, not a repo change.)
 
@@ -226,40 +242,56 @@ Expected: `hbot status` (run again) reports the strategy is no longer active.
 
 **Files:** none in `hft-bots` — clones to `~/hummingbot-api`. Its `.env` (created by `make setup`) holds real secrets and must never be copied into this repo.
 
-- [ ] **Step 1: Clone**
+- [x] **Step 1: Clone**
 
 ```bash
 git clone https://github.com/hummingbot/hummingbot-api.git ~/hummingbot-api
 cd ~/hummingbot-api
 ```
 
-- [ ] **Step 2: Run setup**
+- [x] **Step 2: Run setup**
+
+`setup.sh`'s prompts use `/dev/tty` when stdin isn't a terminal, which would hang a non-interactive run — detach from the controlling terminal with `setsid` first so it falls back to reading stdin directly, and feed the answers (username, password, password-confirm, config-password, config-password-confirm, tailscale-answer) that way:
 
 ```bash
-make setup
+API_USERNAME="admin"
+API_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=')
+CONFIG_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=')
+{
+  echo "HUMMINGBOT_API_USERNAME=$API_USERNAME"
+  echo "HUMMINGBOT_API_PASSWORD=$API_PASSWORD"
+  echo "HUMMINGBOT_API_CONFIG_PASSWORD=$CONFIG_PASSWORD"
+} > ~/.hummingbot-api-credentials
+chmod 600 ~/.hummingbot-api-credentials
+
+cd ~/hummingbot-api
+sg docker -c 'setsid ./setup.sh' <<EOF
+$API_USERNAME
+$API_PASSWORD
+$API_PASSWORD
+$CONFIG_PASSWORD
+$CONFIG_PASSWORD
+n
+EOF
 ```
 
-Answer the interactive prompts:
-- API username: `admin`
-- API password: choose one, write it down somewhere outside this repo — you'll need it in Task 7
-- Config password (encrypts bot credentials): choose one, write it down the same way
-- Tailscale: answer **`n`** — not needed for local-only personal use
+Tailscale answered **`n`** — not needed for local-only personal use. Confirmed: `.env created successfully!`, mode `600`.
 
-- [ ] **Step 3: Deploy**
+- [x] **Step 3: Deploy**
 
 ```bash
-make deploy
+sg docker -c 'make deploy'
 ```
 
-- [ ] **Step 4: Verify all three containers are up**
+- [x] **Step 4: Verify all three containers are up**
 
-Run: `docker ps --format '{{.Names}}\t{{.Status}}'`
-Expected: three lines for `hummingbot-api`, `hummingbot-broker`, `hummingbot-postgres`, all showing `Up`.
+Run: `sg docker -c 'docker ps --format "{{.Names}}\t{{.Status}}"'`
+Expected: three lines for `hummingbot-api`, `hummingbot-broker`, `hummingbot-postgres`, all showing `Up` (and `healthy` shortly after). Confirmed — also confirmed the swap file from Task 1 is already in active use (`Swap: 199Mi` used) running all four containers (including the Task 5 `hummingbot` one) at once on this 2.7GB box.
 
-- [ ] **Step 5: Verify the API answers**
+- [x] **Step 5: Verify the API answers**
 
 Run: `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/docs`
-Expected: `200`
+Expected: `200`. Confirmed.
 
 (No git commit — secrets live in `~/hummingbot-api/.env`, outside this repo.)
 
@@ -272,26 +304,27 @@ Expected: `200`
 **Interfaces:**
 - Consumes: hummingbot-api listening on `127.0.0.1:8000` from Task 6, and the API username/password chosen in Task 6 Step 2.
 
-- [ ] **Step 1: Run the dashboard container with host networking**
+- [x] **Step 1: Run the dashboard container with host networking**
 
 The dashboard's own default `docker-compose.yml` expects a service named `backend-api` on a shared Compose network, which doesn't exist here since hummingbot-api was deployed as its own separate stack. Use `--network host` instead so the dashboard container can reach the API at `127.0.0.1:8000` directly:
 
 ```bash
-docker run -d --name hummingbot-dashboard \
+source ~/.hummingbot-api-credentials
+sg docker -c "docker run -d --name hummingbot-dashboard \
   --network host \
   --restart unless-stopped \
   -e AUTH_SYSTEM_ENABLED=False \
   -e BACKEND_API_HOST=localhost \
   -e BACKEND_API_PORT=8000 \
-  -e BACKEND_API_USERNAME=admin \
-  -e BACKEND_API_PASSWORD=<the password you set in Task 6 Step 2> \
-  hummingbot/dashboard:latest
+  -e BACKEND_API_USERNAME='\$HUMMINGBOT_API_USERNAME' \
+  -e BACKEND_API_PASSWORD='\$HUMMINGBOT_API_PASSWORD' \
+  hummingbot/dashboard:latest"
 ```
 
-- [ ] **Step 2: Verify it's serving**
+- [x] **Step 2: Verify it's serving**
 
 Run: `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8501`
-Expected: `200`
+Expected: `200`. Confirmed — RAM held (swap absorbed the extra load: 481Mi swap used, 1.0Gi still available, all four containers plus this one running).
 
 - [ ] **Step 3: Open it in the browser**
 
@@ -308,6 +341,97 @@ In the dashboard UI, confirm: the new bot shows status `running`, its simulated 
 
 (No git commit — runtime state only.)
 
+**Outcome — superseded by Phase 1b below.** Step 4 (deploying a bot through the
+dashboard's own Deploy page) surfaced real bugs rather than a working
+dashboard: three fixable config/mount issues, then a genuine upstream
+Hummingbot bug (`PaperTradeExchange` has no `trading_rules`) that stops
+controller-based bots from ever placing a paper order. The Streamlit
+dashboard and its supporting containers were stopped and removed. See
+`hummingbot-setup-spec.md` Phase 1b and Task 7b below for the replacement.
+
+---
+
+### Task 7b: Custom status page (replaces the dashboard for status/PnL)
+
+**Context:** hummingbot-api's dashboard is built around *controller*-based
+bots (V2 controllers + PositionExecutor), which report performance/PnL over
+MQTT — but that path can't place paper trade orders on this hummingbot-api
+version (upstream bug). The *script*-based bot (`simple_pmm.py`, same one
+proven working in Task 5) trades correctly but never reports "running"
+through that same MQTT/controller pipeline, so the dashboard always shows it
+as stopped with an empty PnL panel. Full root-cause chain is in
+`hummingbot-setup-spec.md` Phase 1b.
+
+**Files:**
+- Create: `status-page/status_server.py`
+
+**Decision:** don't fight hummingbot-api's controller-oriented status
+pipeline. Instead read the standalone `hummingbot` container's own `hbot`
+CLI directly (`docker exec hummingbot hbot status --json` / `hbot history`)
+— the same CLI already proven to give clean structured output in Task 5 —
+and serve it as a tiny local web page. No log scraping, no dependency on
+MQTT/controllers.
+
+- [x] **Step 1: Confirm the CLI gives usable structured data**
+
+```bash
+sg docker -c 'hbot status --json'
+```
+
+Confirmed: `running`, `strategy`, `uptime_s`, `errors.{count,messages}`, and
+a full `balances` dict are clean JSON. Active orders (price/amount/age)
+only appear inside a pretty-printed `format_status` string (no `--json` for
+that part), in a fixed-width table — parseable with one regex. `hbot
+history` has no `--json` flag either; rendered as raw text in a `<pre>`
+block rather than guessing at an unseen table format.
+
+- [x] **Step 2: Write the server**
+
+Stdlib-only Python (`http.server`, `subprocess`, `re`, `threading`) — no
+new dependencies. A background thread polls `hbot status --json` +
+`hbot history` every 5s (default) via `docker exec`, plus hummingbot-api's
+public `/market-data/prices` endpoint (reads credentials from
+`~/hummingbot-api/.env`) for a reference market price shown next to the
+bot's own buy/sell quotes. Serves `GET /` (HTML+JS, polls `/api/state`
+every 5s) and `GET /api/state` (JSON snapshot).
+
+- [x] **Step 3: Run it**
+
+```bash
+cd status-page
+python3 status_server.py
+```
+
+(Needs the `docker` group from Task 3 to be active in the shell — open a
+fresh terminal if you get a docker permission error.)
+
+- [x] **Step 4: Verify**
+
+Run: `curl -s http://127.0.0.1:8600/api/state`
+Expected: JSON with `running: true`, real `active_orders` (price/amount
+matching the live paper-trade quotes), `balances`, and `market_price`.
+Confirmed — including catching and fixing a real bug where the HTML
+template's CSS/JS used doubled `{{ }}` braces (leftover from an unused
+`.format()` escaping pattern) that were never substituted, breaking the
+page. Visually confirmed in-browser: RUNNING badge, orders bracketing the
+live BTC-USDT market price, auto-refreshing.
+
+- [x] **Step 5: Clean up now-redundant containers**
+
+```bash
+sg docker -c 'docker stop hummingbot-dashboard paper-bot-<timestamp>'
+sg docker -c 'docker rm hummingbot-dashboard paper-bot-<timestamp>'
+```
+
+Removed the Streamlit dashboard container and the API-orchestrated
+duplicate script bot — both dead weight once the custom status page took
+over, freeing RAM on this 2.7GB box. `hummingbot-api` (+ Postgres + EMQX)
+was left running since it still serves the public market-data endpoint the
+status page uses, and may be useful for Phase 2.
+
+(No git commit for container operations — `git add status-page/` happens
+in Task 8.)
+
 ---
 
 ### Task 8: Document the workflow
@@ -320,44 +444,60 @@ In the dashboard UI, confirm: the new bot shows status `running`, its simulated 
 ```markdown
 # HFT-bots — Hummingbot Paper-Trading Setup
 
-Personal Hummingbot setup notes. This repo holds configs/notes only —
-Hummingbot itself lives in separate clones outside this repo (see below).
+Personal Hummingbot setup notes. This repo holds configs/notes/status-page
+code only — Hummingbot itself lives in separate clones outside this repo.
 
 ## Layout
-- `~/hummingbot` — Hummingbot client (Docker), driven via the `hbot` CLI
-- `~/hummingbot-api` — backend API + Postgres + EMQX broker (Docker Compose)
-- `hummingbot-dashboard` container — Streamlit UI, hand-wired to the API
+- `~/hummingbot` — Hummingbot client (Docker), driven via the `hbot` CLI.
+  This is the bot that actually trades — created/started in Phase 1 step 2.
+- `~/hummingbot-api` — backend API + Postgres + EMQX broker (Docker
+  Compose). Kept running for its public market-data endpoint and for
+  Phase 2; its own dashboard/controller-based bot deployment is NOT used
+  (see Phase 1b in `hummingbot-setup-spec.md` for why).
+- `status-page/status_server.py` — this repo's own lightweight status page,
+  reads the `hummingbot` container's `hbot` CLI directly. Replaces the
+  official Streamlit dashboard, which was removed.
 
 ## Start everything
 ```bash
-cd ~/hummingbot && make deploy          # Hummingbot client
-cd ~/hummingbot-api && make deploy      # API + Postgres + EMQX
-docker start hummingbot-dashboard       # Dashboard (created once via `docker run`, see setup plan)
+cd ~/hummingbot && make deploy          # Hummingbot client (Docker)
+cd ~/hummingbot-api && make deploy      # API + Postgres + EMQX (optional, for market price)
+HBOT_PASSWORD=$(cat ~/.hbot_keystore_password) hbot start conf_paper_bot.yml
+cd status-page && python3 status_server.py   # http://localhost:8600
 ```
 
 ## Stop everything
 ```bash
-docker stop hummingbot-dashboard
+hbot stop
 cd ~/hummingbot-api && make stop
 cd ~/hummingbot && docker compose down
+# Ctrl+C the status_server.py process
 ```
 
 ## Check status
-- CLI bot: `hbot status` (after `hbot start <config>.yml`)
-- API: `curl -s http://127.0.0.1:8000/docs` should return the Swagger page
-- Dashboard: open `http://localhost:8501` in the browser
+- Web: open `http://localhost:8600` — running badge, active orders vs.
+  live market price, balances, trade history/PnL, auto-refreshing.
+- CLI: `hbot status` / `hbot status --json` / `hbot history`
+- API (Swagger only, not a real dashboard): `http://127.0.0.1:8000/docs`
 
 ## Create a new paper-trading bot via the CLI
 ```bash
 hbot create simple_pmm --name conf_paper_bot.yml \
      --set exchange=binance_paper_trade --set trading_pair=BTC-USDT
-hbot start conf_paper_bot.yml
+HBOT_PASSWORD=$(cat ~/.hbot_keystore_password) hbot start conf_paper_bot.yml
 ```
 
+## Known limitation
+hummingbot-api's own dashboard/controller-based bot deployment doesn't work
+for paper trading on this version (upstream bug — see
+`hummingbot-setup-spec.md` Phase 1b). Use `status-page/` instead.
+
 ## Secrets
-Never in this repo. Live in `~/hummingbot-api/.env` and Hummingbot's own
-encrypted keystore. `.gitignore` here covers `.env*`, `*.key`, `conf/`,
-`keystore*` as a backstop, but the real rule is: don't put them here at all.
+Never in this repo. Hummingbot's keystore password lives in
+`~/.hbot_keystore_password`; hummingbot-api's credentials live in
+`~/hummingbot-api/.env`. `.gitignore` here covers `.env*`, `*.key`,
+`conf/`, `keystore*` as a backstop, but the real rule is: don't put them
+here at all.
 
 ## Phase 2 (not started)
 Condor (AI agent layer) is deliberately out of scope until this phase is
@@ -367,6 +507,6 @@ fully verified and stable — see `hummingbot-setup-spec.md`.
 - [ ] **Step 2: Commit**
 
 ```bash
-git add README.md
-git commit -m "docs: document hummingbot paper-trading + dashboard workflow"
+git add README.md status-page/
+git commit -m "docs: document hummingbot paper-trading + status-page workflow"
 ```
