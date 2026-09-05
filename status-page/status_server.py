@@ -338,8 +338,8 @@ def _poll_once(container: str, api_url: str, api_env: str, price_connector: str,
         errors = status.get("errors", {})
         snapshot["error_count"] = errors.get("count", 0)
         snapshot["errors"] = errors.get("messages", [])
-        snapshot["balances"] = status.get("balances", {})
-        snapshot["active_orders"] = parse_active_orders(status.get("format_status", ""))
+        snapshot["balances"] = status.get("balances") or {}
+        snapshot["active_orders"] = parse_active_orders(status.get("format_status") or "")
     except Exception as exc:
         snapshot["fetch_error"] = f"status: {exc}"
 
