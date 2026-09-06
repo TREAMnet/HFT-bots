@@ -23,6 +23,14 @@ between this page's own poller and the engine's startup sequence, fixed;
 plus a second, unconfirmed cause that wasn't) — see
 hummingbot-setup-spec.md Phase 1c for the full writeup.
 
+Phase 1e adds paper-balance persistence: Hummingbot re-seeds its paper
+exchange from conf_client.yml's static defaults on every `hbot start`, so a
+restart (needed for every control-panel change) silently resets capital
+while `hbot history` PnL keeps accumulating. A background thread checkpoints
+the live balances back into that config every --checkpoint-interval seconds
+and on Stop, so the next start resumes instead of resetting. See
+hummingbot-setup-spec.md Phase 1e.
+
 Usage: python3 status_server.py [--container hummingbot] [--port 8600]
 No third-party dependencies — stdlib only.
 """
@@ -44,6 +52,12 @@ ORDER_ROW_RE = re.compile(
 )
 PAIR_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+$")
 CONFIG_FILE_PATH = "/home/hummingbot/conf/scripts/conf_paper_bot.yml"
+CONF_CLIENT_PATH = "/home/hummingbot/conf/conf_client.yml"
+# Global (not strategy) client setting Hummingbot seeds the paper exchange
+# from on every `hbot start`. See paper-balance persistence section below.
+PAPER_BALANCE_KEY = "paper_trade.paper_trade_account_balance"
+PAPER_BALANCE_ROUND = 8
+CHECKPOINT_INTERVAL_S = 60.0
 
 state_lock = threading.Lock()
 # `hbot status` sends SIGUSR1 to ask the engine for a fresh snapshot — but the
@@ -76,6 +90,9 @@ state = {
     "fetch_error": None,
     "market_prices": {},
     "config_fields": {},
+    # Last paper-balance checkpoint written back to conf_client.yml
+    # (spec Phase 1e). {"at": str|None, "ok": bool|None, "error": str, "assets": int}
+    "paper_checkpoint": {"at": None, "ok": None, "error": "", "assets": 0},
 }
 
 
@@ -201,6 +218,113 @@ def read_current_config(container: str) -> dict:
     fields["trading_pairs"] = pairs
     fields["order_amount"] = amounts or ({p: legacy_amount for p in pairs} if legacy_amount is not None else {})
     return fields
+
+
+# --- Paper-balance persistence (hummingbot-setup-spec.md Phase 1e) ----------
+#
+# Hummingbot re-seeds its paper exchange from the static
+# `paper_trade.paper_trade_account_balance` dict in conf_client.yml on EVERY
+# `hbot start` — it never writes the live balance back, so every restart
+# (and the semi-automated control-panel workflow needs one for every pair /
+# param change) silently resets capital to defaults while the sqlite-backed
+# `hbot history` PnL keeps accumulating across restarts. These helpers let
+# this page checkpoint the live balances back into that config on a timer
+# and on Stop, so the next start resumes instead of resetting. Read-on-start
+# needs no code — Hummingbot already reads that key itself.
+
+
+def extract_paper_balances(balances: dict) -> dict:
+    """Pull the flat {asset: amount} map out of the poller's nested
+    {"<connector>_paper_trade": {asset: amount}} snapshot. Only ever one
+    paper connector here; return its map, or {} if absent/empty."""
+    for _connector, assets in (balances or {}).items():
+        if assets:
+            return dict(assets)
+    return {}
+
+
+def parse_paper_balance_block(conf_client_text: str) -> dict:
+    """Minimal reader for conf_client.yml's `paper_trade_account_balance:`
+    sub-block (asset -> amount). Same approach as read_current_config(): a
+    targeted decoder for exactly the shape `hbot config` writes (4-space
+    `ASSET: number` rows under the 2-space section key), not a general YAML
+    parser — so the checkpoint thread can read via a ~0.2s `docker exec cat`
+    instead of paying `hbot config`'s ~7s CLI cold-start just to read."""
+    out: dict = {}
+    in_block = False
+    for line in conf_client_text.splitlines():
+        if line.strip() == "paper_trade_account_balance:":
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if line.startswith("    ") and ":" in line:
+            asset, _, amount = line.strip().partition(":")
+            try:
+                out[asset.strip()] = float(amount.strip())
+            except ValueError:
+                continue
+        else:
+            break  # dedent / blank line ends the block
+    return out
+
+
+def merge_balances(current: dict, snapshot: dict) -> dict:
+    """Snapshot values win; assets present only in `current` are kept, so a
+    transient partial `hbot status` read can never drop an asset from the
+    persisted config."""
+    merged = dict(current)
+    merged.update(snapshot)
+    return merged
+
+
+def render_balance_json(balances: dict) -> str:
+    rounded = {k: round(float(v), PAPER_BALANCE_ROUND) for k, v in balances.items()}
+    return json.dumps(rounded, sort_keys=True)
+
+
+def should_checkpoint(running: bool, balances: dict, last_ts: float, now: float, interval: float) -> bool:
+    return bool(running) and bool(balances) and (now - last_ts) >= interval
+
+
+def read_client_paper_balances(container: str) -> dict:
+    result = subprocess.run(
+        ["docker", "exec", container, "cat", CONF_CLIENT_PATH],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return {}
+    return parse_paper_balance_block(result.stdout)
+
+
+def write_paper_balances(container: str, balances: dict) -> dict:
+    """Persist via the supported CLI path (`hbot config <key> <json>`), which
+    rewrites only this one key in conf_client.yml and leaves every other
+    section untouched. ~7s CLI cold-start — fine here because this only runs
+    on the ~60s checkpoint thread and on an explicit Stop, never in a page
+    request path. Returns {"success": bool, "error": str}."""
+    proc = subprocess.run(
+        ["docker", "exec", container, "hbot", "config", PAPER_BALANCE_KEY, render_balance_json(balances)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return {"success": False, "error": proc.stderr.strip() or proc.stdout.strip() or "hbot config failed"}
+    return {"success": True, "error": ""}
+
+
+def checkpoint_paper_balances(container: str, snapshot_balances: dict,
+                              _read=read_client_paper_balances,
+                              _write=write_paper_balances) -> dict:
+    """Merge the latest observed paper balances onto whatever conf_client.yml
+    holds right now and persist the result. Returns
+    {"success": bool, "error": str, "assets": int}. The _read/_write seams
+    are for tests only."""
+    if not snapshot_balances:
+        return {"success": False, "error": "no balance data to checkpoint", "assets": 0}
+    merged = merge_balances(_read(container), snapshot_balances)
+    result = _write(container, merged)
+    result["assets"] = len(merged) if result.get("success") else 0
+    return result
 
 
 def bot_boot_age_s(container: str) -> float:
@@ -330,6 +454,39 @@ def poll_loop(container: str, interval: float, api_url: str, api_env: str, price
         with state_lock:
             state.update(snapshot)
         time.sleep(interval)
+
+
+def _record_checkpoint(result: dict):
+    with state_lock:
+        state["paper_checkpoint"] = {
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ok": result.get("success", False),
+            "error": result.get("error", ""),
+            "assets": result.get("assets", 0),
+        }
+
+
+def checkpoint_loop(container: str, interval: float):
+    """Persist the live paper balances back into conf_client.yml every
+    `interval` seconds so a restart resumes instead of resetting to the
+    hardcoded defaults (hummingbot-setup-spec.md Phase 1e). Deliberately
+    NOT tied to any stop/restart trigger: it checkpoints the same balances
+    the poller already fetches, so a manual `hbot stop; hbot start` in the
+    user's own terminal is covered exactly like the Stop button. The
+    poller reports running=False during the engine's boot window (see
+    BOOT_GRACE_S), so should_checkpoint() naturally skips a mid-restart
+    write of half-initialised balances."""
+    last_ts = time.monotonic()  # first checkpoint one full interval in
+    while True:
+        time.sleep(min(interval, 5.0))
+        with state_lock:
+            running = state.get("running", False)
+            snapshot = extract_paper_balances(state.get("balances", {}))
+        now = time.monotonic()
+        if not should_checkpoint(running, snapshot, last_ts, now, interval):
+            continue
+        _record_checkpoint(checkpoint_paper_balances(container, snapshot))
+        last_ts = now
 
 
 def _poll_once(container: str, api_url: str, api_env: str, price_connector: str, default_pair: str) -> dict:
@@ -511,6 +668,17 @@ async function refresh() {
   let errorsHtml = s.errors.length
     ? `<pre class="error">${s.errors.map(esc).join('\\n')}</pre>` : '<div>None</div>';
 
+  // Paper balances are re-seeded from conf_client.yml on every restart, so
+  // the server checkpoints the live balances back into it (~60s and on Stop)
+  // — see hummingbot-setup-spec.md Phase 1e. This line shows when that last
+  // succeeded/failed so it isn't a silent background action.
+  const cp = s.paper_checkpoint || {};
+  const cpHtml = !cp.at
+    ? '<div class="meta">Paper balances not yet checkpointed this session.</div>'
+    : cp.ok
+      ? `<div class="meta">Paper balances checkpointed ${esc(cp.at)} (${cp.assets} assets) — a restart resumes from here, not from defaults.</div>`
+      : `<div class="meta error">Paper-balance checkpoint failed at ${esc(cp.at)}: ${esc(cp.error)}</div>`;
+
   // One badge per currently-active pair — appears/disappears as pairs are
   // added/removed, rather than a single hardcoded pair.
   const priceEntries = Object.entries(s.market_prices || {});
@@ -533,6 +701,7 @@ async function refresh() {
       <h3>Balances (paper)</h3>
       <table><thead><tr><th>Exchange</th><th>Asset</th><th>Total</th></tr></thead>
       <tbody>${balanceRows}</tbody></table>
+      ${cpHtml}
     </section>
 
     <section>
@@ -756,6 +925,13 @@ class Handler(BaseHTTPRequestHandler):
                 current_fields["order_amount"] = {p: round(usdt_amount / prices[p], 8) for p in pairs}
             result = write_config(container, current_fields)
         elif self.path == "/api/bot/stop":
+            # Checkpoint paper balances BEFORE stopping so the next start
+            # resumes from here instead of resetting to defaults (spec
+            # Phase 1e). Best-effort — a checkpoint failure is recorded for
+            # the page but must not block the stop.
+            with state_lock:
+                snapshot = extract_paper_balances(state.get("balances", {}))
+            _record_checkpoint(checkpoint_paper_balances(container, snapshot))
             r = subprocess.run(["docker", "exec", container, "hbot", "stop"],
                                 capture_output=True, text=True, timeout=15)
             result = {"success": r.returncode == 0, "error": "" if r.returncode == 0 else r.stdout.strip()}
@@ -788,6 +964,8 @@ def main():
     parser.add_argument("--price-pair", default="BTC-USDT", help="Trading pair to show the market price for")
     parser.add_argument("--hbot-password-file", default="~/.hbot_keystore_password",
                          help="Path to the raw Hummingbot keystore password, for restart-after-apply")
+    parser.add_argument("--checkpoint-interval", type=float, default=CHECKPOINT_INTERVAL_S,
+                         help="Seconds between paper-balance checkpoints into conf_client.yml (spec Phase 1e)")
     args = parser.parse_args()
 
     poller = threading.Thread(
@@ -797,10 +975,18 @@ def main():
     )
     poller.start()
 
+    checkpointer = threading.Thread(
+        target=checkpoint_loop,
+        args=(args.container, args.checkpoint_interval),
+        daemon=True,
+    )
+    checkpointer.start()
+
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.container = args.container
     server.hbot_password_file = args.hbot_password_file
-    print(f"Status page: http://localhost:{args.port}  (polling container '{args.container}' every {args.interval}s)")
+    print(f"Status page: http://localhost:{args.port}  (polling container '{args.container}' every {args.interval}s, "
+          f"checkpointing paper balances every {args.checkpoint_interval:g}s)")
     server.serve_forever()
 
 

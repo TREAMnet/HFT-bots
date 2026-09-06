@@ -113,11 +113,20 @@ alternative dashboard — the original spec deferred it specifically to
 avoid debugging two systems at once, which still applies. Revisit only
 once Phase 1c's current bug is resolved and trading is confirmed working.
 
+**Phase 1e — Persist paper balances across restarts: done (Sept 2026).**
+Hummingbot re-seeds paper balances from `conf_client.yml` defaults on every
+`hbot start`, so each restart (needed for every control-panel change) reset
+capital while `hbot history` PnL kept accumulating. `status_server.py` now
+runs a background thread that checkpoints the live balances back into
+`conf_client.yml` every 60s and on Stop, via `hbot config`. Not tied to any
+restart trigger, so a manual `hbot stop; hbot start` is covered like the
+Stop button. Verified with a real stop/start: balances resumed from the
+checkpoint, not the defaults. See `hummingbot-setup-spec.md` Phase 1e.
+
 **Phase 1 overall: fully verified working again** — paper trading,
 monitoring, and multi-pair controls (including in-progress input surviving
 the background poller) all confirmed working after the three-round Phase 1c
-regression fix above. Still open: the zero-fills question flagged above,
-and the USDT-denomination UI note in `hummingbot-setup-spec.md` Phase 1c.
+regression fix above. Still open: the zero-fills question flagged above.
 
 **Phase 2 — Condor (AI agent layer): not started, deliberately deferred.**
 - Repo: `https://github.com/hummingbot/condor`

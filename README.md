@@ -61,6 +61,18 @@ The live config is always readable as plain YAML at
 `~/hummingbot/conf/scripts/conf_paper_bot.yml` (or via `hbot config
 --json`), independent of the control panel.
 
+### Paper balances persist across restarts
+Hummingbot re-seeds paper balances from `conf_client.yml`'s static defaults
+on every `hbot start`, so without help every restart (including the manual
+command above) would silently reset capital while `hbot history` PnL keeps
+accumulating. `status_server.py` prevents this: a background thread writes
+the live balances back into `conf_client.yml` every 60s
+(`--checkpoint-interval` to change) and once more when you press **Stop**, so
+the next start resumes where the last run left off. The page shows a
+"Paper balances checkpointed …" line under Balances. No effect on live
+trading — this is a paper-only mechanism. If the laptop sleeps or the
+process is killed uncleanly you lose at most one interval of paper fills.
+
 ## Create a new paper-trading bot via the CLI
 ```bash
 hbot create simple_pmm --name conf_paper_bot.yml \

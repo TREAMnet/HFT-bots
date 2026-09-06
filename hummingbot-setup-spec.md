@@ -268,6 +268,70 @@ params can be tested without hand-editing config files or the CLI.
 
 ---
 
+## Phase 1e: Persist paper balances across restarts
+
+> ✅ **Implemented (Sept 2026).** Checkpoint logic lives in
+> `status-page/status_server.py` (HFT-bots repo, not vendored Hummingbot).
+> Verified: after a full `hbot stop; hbot start`, the paper exchange seeds
+> from the checkpointed balances (USDT ~100 050 / DOGE ~999 450) instead of
+> the hardcoded defaults (100 000 / 1 000 000).
+>
+> **How it works:**
+> - Paper balances are re-seeded on every `hbot start` from the global
+>   `paper_trade.paper_trade_account_balance` dict in the container's
+>   `conf/conf_client.yml` (`connector.set_balance()` per asset). Hummingbot
+>   has **no** built-in write-back, so a custom read-on-start/write-on-stop
+>   layer was needed — except read-on-start needs no code, since Hummingbot
+>   already reads that key itself.
+> - A background thread in `status_server.py` (separate from the poller)
+>   checkpoints the live balances — the same ones the poller already fetches
+>   from `hbot status --json` — back into that config every
+>   `--checkpoint-interval` seconds (default 60s), and once more immediately
+>   when the **Stop** button is pressed.
+> - Deliberately not tied to any restart trigger: because it tracks polled
+>   balances rather than hooking the stop action, a manual
+>   `hbot stop; hbot start` in Jay's own terminal (the semi-automated
+>   Phase 1c workflow) is covered exactly like the Stop button.
+> - Writes go through the supported CLI path
+>   (`hbot config paper_trade.paper_trade_account_balance '<json>'`), which
+>   rewrites only that one key and leaves every other section of
+>   `conf_client.yml` untouched. ~7s CLI cold-start, which is why it runs
+>   only on the 60s thread / on Stop, never in a page request path. The
+>   read side uses a fast `docker exec cat` + minimal parse instead.
+> - The snapshot is merged onto whatever the config holds at write time
+>   (snapshot values win, other assets preserved), so a transient partial
+>   `hbot status` read can't drop an asset from the persisted config.
+> - Worst case on an unclean stop (kill -9, laptop sleep): lose up to one
+>   checkpoint interval of paper fills. Negligible for paper testing.
+> - The page shows a "Paper balances checkpointed <time> (<n> assets)" line
+>   under Balances so it isn't a silent background action.
+> - `hbot history` / PnL (sqlite-backed) already persisted across restarts;
+>   with balances now continuous too, the two are consistent — no history
+>   change was needed.
+
+**Problem observed (Sept 2026):** Hummingbot's paper trading engine resets
+balances to their configured defaults (e.g. `1 BTC`, `100,000 USDT`) on
+every restart — it initializes a fresh simulated exchange each launch, it
+doesn't resume from where the last run left off. Meanwhile, the custom
+status page's trade history / PnL log is a separate, independently
+accumulating record that is **not** reset on restart — it keeps summing
+trades across every restart indefinitely.
+
+Since the control panel's normal workflow requires a restart for every pair
+addition/removal or parameter change (per the semi-automated design in
+Phase 1c), this produces a growing inconsistency: the *actual* current
+paper inventory resets with every tweak, while the *reported* cumulative
+PnL/trade stats treat the whole history as one unbroken run. This
+undermines longer-running tests, since each restart silently resets capital
+without resetting — or even flagging — the scoreboard.
+
+**Goal:** make Hummingbot's paper balances persist across restarts, so a
+restart to change a pair or a parameter continues the same ongoing test
+rather than quietly resetting capital while stats keep compounding as if
+it hadn't.
+
+---
+
 ## Phase 2 (later, separate task): Condor — AI agent layer
 - Repo: `https://github.com/hummingbot/condor`
 - Condor is an AI agent harness that sits on top of the Hummingbot API — it lets an LLM make trading decisions (entries/exits, parameter adjustments) while Hummingbot executes the actual trades.
